@@ -41,6 +41,7 @@ ASSET_RISK_OVERRIDES = {
     "BTCUSDT": {"sl_mult": 2.2, "tp_mult": 3.5},
     "XAU/USD": {"sl_mult": 2.5, "tp_mult": 4.0},
     "XAG/USD": {"sl_mult": 2.5, "tp_mult": 4.0},
+    "GBP/USD": {"sl_mult": 2.0, "tp_mult": 3.5},  # "Cable" — sharper moves than EUR/USD, tight SL got stopped out too often (20.4% WR at default 1.5x)
 }
 
 
