@@ -166,7 +166,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit = int(context.args[1])
         except ValueError:
             pass
-    limit = max(50, min(limit, 1500))  # keep it reasonable so it doesn't time out
+    limit = max(50, min(limit, 5000))  # TwelveData free plan's max outputsize; larger = same 1 request, just more data
 
     await update.message.reply_text(f"Running backtest on {symbol} ({limit} candles)... this can take a minute.")
 
