@@ -76,16 +76,26 @@ def fetch_binance_candles(symbol: str, interval: str, limit: int = config.CANDLE
 
 TWELVEDATA_BASE = "https://api.twelvedata.com"
 
+# Our internal interval strings (shared with Binance, which uses '15m', '1h',
+# '4h', etc.) don't all match what TwelveData expects (it wants '15min' for
+# sub-hour intervals). Map them here rather than changing the shared config.
+TWELVEDATA_INTERVAL_MAP = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "45m": "45min",
+    "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1day",
+}
+
 
 def fetch_twelvedata_candles(symbol: str, interval: str, limit: int = config.CANDLE_LIMIT) -> pd.DataFrame:
     """Fetch OHLCV candles for a forex/metal symbol, e.g. 'EUR/USD'."""
     if not config.TWELVEDATA_API_KEY:
         raise ValueError("TWELVEDATA_API_KEY is not set. Add it to your environment variables.")
 
+    td_interval = TWELVEDATA_INTERVAL_MAP.get(interval, interval)
+
     url = f"{TWELVEDATA_BASE}/time_series"
     params = {
         "symbol": symbol.upper(),
-        "interval": interval,
+        "interval": td_interval,
         "outputsize": limit,
         "apikey": config.TWELVEDATA_API_KEY,
     }
