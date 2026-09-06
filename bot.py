@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -6,6 +7,7 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters,
 )
 
+import backtest
 import config
 import data_fetcher as dfetch
 import strategy
@@ -154,6 +156,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/backtest BTCUSDT` or `/backtest EUR/USD 500`\n"
+            "(second number = how many historical candles, default 500)",
+            parse_mode="Markdown",
+        )
+        return
+
+    symbol = context.args[0].upper()
+    limit = 500
+    if len(context.args) > 1:
+        try:
+            limit = int(context.args[1])
+        except ValueError:
+            pass
+    limit = max(50, min(limit, 1500))  # keep it reasonable so it doesn't time out
+
+    await update.message.reply_text(f"Running backtest on {symbol} ({limit} candles)... this can take a minute.")
+
+    try:
+        is_forex = dfetch.is_forex_symbol(symbol)
+        entry_interval = config.ENTRY_INTERVAL_TWELVEDATA if is_forex else config.ENTRY_INTERVAL_BINANCE
+        trend_interval = config.TREND_INTERVAL_TWELVEDATA if is_forex else config.TREND_INTERVAL_BINANCE
+
+        # Run the (blocking, CPU-bound) backtest off the event loop so other
+        # users aren't stuck waiting behind it.
+        trades = await asyncio.to_thread(
+            backtest.run_backtest, symbol, entry_interval, trend_interval, limit, 100
+        )
+        report = backtest.build_report_text(trades, symbol)
+        await update.message.reply_text(report)
+    except Exception as e:
+        logger.exception("Backtest failed for %s", symbol)
+        await update.message.reply_text(f"⚠️ Backtest failed for {symbol}: {e}")
+
+
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send /start to open the menu, or `/signal SYMBOL` for a direct check.",
@@ -172,6 +211,7 @@ async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "Open the Crypto / Forex menu"),
         BotCommand("signal", "Get a signal for a pair, e.g. /signal BTCUSDT"),
+        BotCommand("backtest", "Backtest a pair, e.g. /backtest BTCUSDT 1000"),
     ])
 
 
@@ -179,6 +219,7 @@ def build_app():
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", signal_command))
+    app.add_handler(CommandHandler("backtest", backtest_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
     return app
