@@ -1,6 +1,6 @@
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters,
@@ -165,8 +165,18 @@ async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # App builder
 # ---------------------------------------------------------------------
 
+async def post_init(application: Application):
+    """Registers the native Telegram command menu — the same '/' popup you
+    see in BotFather with /newbot, /deletebot etc. Users tap the menu icon
+    or type '/' to see these, instead of having to remember /start."""
+    await application.bot.set_my_commands([
+        BotCommand("start", "Open the Crypto / Forex menu"),
+        BotCommand("signal", "Get a signal for a pair, e.g. /signal BTCUSDT"),
+    ])
+
+
 def build_app():
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signal", signal_command))
     app.add_handler(CallbackQueryHandler(button_handler))
