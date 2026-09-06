@@ -94,19 +94,26 @@ def price_in_fib_zone(price: float, fib: dict, tolerance_pct=0.15) -> bool:
     return (lo - slack) <= price <= (hi + slack)
 
 
-def detect_bos(df: pd.DataFrame, lookback=30) -> str:
+def detect_bos(df: pd.DataFrame, lookback=30, margin=0.0) -> str:
     """
-    Very simplified Break of Structure detector.
-    Returns 'bullish_bos' if price closed above the recent swing high,
-    'bearish_bos' if it closed below the recent swing low, else 'none'.
+    Break of Structure detector.
+    Returns 'bullish_bos' if price closed above the recent swing high by at
+    least `margin` (in price units), 'bearish_bos' if it closed below the
+    recent swing low by at least `margin`, else 'none'.
+
+    The margin exists because a break by a hair's width is usually noise —
+    especially on spiky instruments like gold, where a single wick often
+    pokes past a level and immediately reverses (a "stop hunt"). Requiring
+    the close to clear the level by a real amount (typically a fraction of
+    ATR, computed by the caller) filters most of those false breaks out.
     """
     recent = df.tail(lookback)
     prior = recent.iloc[:-1]
     last_close = recent.iloc[-1]["close"]
 
-    if last_close > prior["high"].max():
+    if last_close > prior["high"].max() + margin:
         return "bullish_bos"
-    if last_close < prior["low"].min():
+    if last_close < prior["low"].min() - margin:
         return "bearish_bos"
     return "none"
 
