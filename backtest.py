@@ -123,11 +123,12 @@ def run_backtest(symbol: str, entry_interval: str, trend_interval: str, limit: i
     return trades
 
 
-def print_report(trades, symbol):
+def build_report_text(trades, symbol) -> str:
     if not trades:
-        print(f"\nNo trades were triggered for {symbol} in this data range.")
-        print("Try a longer --limit, or a different pair/timeframe.")
-        return
+        return (
+            f"No trades were triggered for {symbol} in this data range.\n"
+            f"Try a longer limit, or a different pair/timeframe."
+        )
 
     n = len(trades)
     wins = [t for t in trades if t["outcome"] == "win"]
@@ -140,23 +141,29 @@ def print_report(trades, symbol):
 
     avg_r = sum(t["r_multiple"] for t in trades) / n
 
-    # Equity curve in R-multiples, for max drawdown
     equity = np.cumsum([t["r_multiple"] for t in trades])
     running_max = np.maximum.accumulate(equity)
     drawdown = running_max - equity
     max_dd = drawdown.max() if len(drawdown) else 0
 
-    print(f"\n===== Backtest report: {symbol} =====")
-    print(f"Total trades:     {n}")
-    print(f"Wins / Losses:    {len(wins)} / {len(losses)}")
-    print(f"Win rate:         {win_rate:.1f}%")
-    print(f"Profit factor:    {profit_factor:.2f}")
-    print(f"Avg R per trade:  {avg_r:.2f}")
-    print(f"Total R:          {equity[-1]:.2f}")
-    print(f"Max drawdown:     {max_dd:.2f}R")
-    print("=======================================")
-    print("Note: this uses fixed R risk-reward from config.py's ATR multipliers.")
-    print("Past performance on historical data does not guarantee future results.")
+    lines = [
+        f"Backtest report: {symbol}",
+        f"Total trades: {n}",
+        f"Wins / Losses: {len(wins)} / {len(losses)}",
+        f"Win rate: {win_rate:.1f}%",
+        f"Profit factor: {profit_factor:.2f}",
+        f"Avg R per trade: {avg_r:.2f}",
+        f"Total R: {equity[-1]:.2f}",
+        f"Max drawdown: {max_dd:.2f}R",
+        "",
+        "Note: fixed R risk-reward from config.py's ATR multipliers.",
+        "Past performance does not guarantee future results.",
+    ]
+    return "\n".join(lines)
+
+
+def print_report(trades, symbol):
+    print("\n" + build_report_text(trades, symbol) + "\n")
 
 
 def save_trades_csv(trades, path):
