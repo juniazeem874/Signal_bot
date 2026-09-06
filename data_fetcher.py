@@ -13,15 +13,37 @@ import config
 # BINANCE (crypto) - free, no API key needed for public market data
 # ---------------------------------------------------------------------
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_HOSTS = [
+    "https://data-api.binance.vision",  # public market-data mirror, no geo-block issues
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
+
+
+def _binance_get(path: str, params: dict) -> dict:
+    """Try each Binance host in order until one responds successfully.
+    Needed because api.binance.com returns HTTP 451 (blocked) from some
+    hosting regions, e.g. certain US-based cloud servers."""
+    last_error = None
+    for host in BINANCE_HOSTS:
+        try:
+            resp = requests.get(f"{host}{path}", params=params, timeout=10)
+            if resp.status_code == 451:
+                last_error = f"{host} blocked this region (HTTP 451)"
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            last_error = f"{host} failed: {e}"
+            continue
+    raise ConnectionError(f"All Binance endpoints failed. Last error: {last_error}")
 
 
 def get_top_crypto_pairs(n=config.CRYPTO_TOP_N, quote=config.CRYPTO_QUOTE_ASSET):
     """Return the top N crypto pairs by 24h quote volume, e.g. ['BTCUSDT', ...]."""
-    url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _binance_get("/api/v3/ticker/24hr", {})
 
     pairs = [d for d in data if d["symbol"].endswith(quote)]
     pairs.sort(key=lambda d: float(d["quoteVolume"]), reverse=True)
@@ -30,11 +52,8 @@ def get_top_crypto_pairs(n=config.CRYPTO_TOP_N, quote=config.CRYPTO_QUOTE_ASSET)
 
 def fetch_binance_candles(symbol: str, interval: str, limit: int = config.CANDLE_LIMIT) -> pd.DataFrame:
     """Fetch OHLCV candles for a Binance symbol, e.g. 'BTCUSDT'."""
-    url = f"{BINANCE_BASE}/api/v3/klines"
     params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()
-    raw = resp.json()
+    raw = _binance_get("/api/v3/klines", params)
 
     if not raw or isinstance(raw, dict):
         raise ValueError(f"No data returned for {symbol}. Check the symbol is correct.")
