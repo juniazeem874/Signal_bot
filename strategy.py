@@ -11,6 +11,8 @@ see what this actually does on real historical data before trusting it.
 
 import math
 
+import pandas as pd
+
 import config
 import indicators as ind
 
@@ -66,7 +68,11 @@ def analyze_mtf(dfs_by_tf: dict, timeframe_stack: list, symbol=None) -> dict:
     entry_df = ind.add_atr(entry_df)
     entry_df = ind.add_volume_avg(entry_df)
 
-    bos = ind.detect_bos(entry_df)
+    atr = entry_df.iloc[-1]["atr"]
+    bos_lookback, bos_margin_mult = config.get_bos_params(symbol)
+    bos_margin = (atr * bos_margin_mult) if not pd.isna(atr) else 0.0
+
+    bos = ind.detect_bos(entry_df, lookback=bos_lookback, margin=bos_margin)
     fvg = ind.detect_fvg(entry_df)
     swing_high, swing_low = ind.find_last_swing(entry_df)
     fib = ind.fibonacci_levels(swing_high, swing_low)
@@ -100,7 +106,6 @@ def analyze_mtf(dfs_by_tf: dict, timeframe_stack: list, symbol=None) -> dict:
             entry_score += 1
             entry_reasons.append(f"Volume spike confirms bearish move on {entry_tf}")
 
-    atr = entry_df.iloc[-1]["atr"]
     sl_mult, tp_mult = config.get_risk_params(symbol)
 
     result = {
