@@ -54,6 +54,31 @@ def get_risk_params(symbol: str):
             return override["sl_mult"], override["tp_mult"]
     return SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER
 
+
+# ---- Break of Structure tuning ----
+# lookback = how many candles define "the recent structure" to break.
+# margin_mult = how far past that level (in units of ATR) price must close
+# before it counts as a real break, not noise. Gold especially fakes out
+# past minor levels before reversing, so it gets a wider lookback (a more
+# meaningful level to break) and a bigger margin (filters the small pokes).
+BOS_DEFAULT_LOOKBACK = 30
+BOS_DEFAULT_MARGIN_MULT = 0.15
+
+BOS_OVERRIDES = {
+    "XAU/USD": {"lookback": 45, "margin_mult": 0.35},
+    "XAG/USD": {"lookback": 45, "margin_mult": 0.35},
+    "BTCUSDT": {"lookback": 30, "margin_mult": 0.20},
+}
+
+
+def get_bos_params(symbol: str):
+    """Returns (lookback, margin_mult) for a symbol, falling back to defaults."""
+    if symbol:
+        override = BOS_OVERRIDES.get(symbol.upper())
+        if override:
+            return override["lookback"], override["margin_mult"]
+    return BOS_DEFAULT_LOOKBACK, BOS_DEFAULT_MARGIN_MULT
+
 # ---- Crypto pair list (Binance) ----
 # "All pairs" via Binance is technically possible (1000+), but for usability
 # we show the top pairs by 24h volume dynamically, plus support typing any
