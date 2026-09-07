@@ -108,7 +108,7 @@ def analyze(entry_df, trend_df):
             "take_profit": tp,
             "rr_ratio": config.MIN_RISK_REWARD,
         })
-    elif bear_score >= min_score and bear_score > bear_score:
+    elif bear_score >= min_score and bear_score > bull_score:
         sl = swing_high * (1.0 + config.SL_BUFFER_PERCENT)
         risk = sl - last_price
         tp = last_price - (risk * config.MIN_RISK_REWARD)
