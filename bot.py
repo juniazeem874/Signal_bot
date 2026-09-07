@@ -30,9 +30,12 @@ async def post_init(application) -> None:
 
 
 async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Utility command to get user's Chat ID for config.py"""
+    """Utility command to get user's Chat ID for config.py / Railway"""
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🆔 Your Telegram Chat ID: `{chat_id}`\n\nPaste this in `config.AUTO_SIGNAL_CHAT_ID`.", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"🆔 Your Telegram Chat ID: `{chat_id}`\n\nAdd this ID to Railway `AUTO_SIGNAL_CHAT_ID` variable.",
+        parse_mode="Markdown"
+    )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -57,7 +60,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         "⚡ **Institutional Scalping Signal Bot**\n\n"
-        "• Manual Signal: Click buttons or use `/signal BTCUSDT`\n"
+        "• Manual Signal: Click buttons or type `/signal BTCUSDT`\n"
         "• Get Chat ID: `/myid`\n"
         "• Auto-Scanner: Active in background for BUY/SELL setups."
     )
@@ -126,9 +129,9 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background task: Scans pairs and sends alerts ONLY on BUY/SELL signals."""
-    chat_id = getattr(config, "AUTO_SIGNAL_CHAT_ID", "")
-    if not chat_id or chat_id == "YOUR_TELEGRAM_CHAT_ID_HERE":
+    """Background task: Scans pairs and sends alerts to ALL registered Chat IDs."""
+    chat_ids = getattr(config, "AUTO_SIGNAL_CHAT_IDS", [])
+    if not chat_ids:
         return
 
     pairs = getattr(config, "AUTO_SCAN_PAIRS", ["BTCUSDT", "XAU/USD", "EUR/USD"])
@@ -142,12 +145,11 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
             analysis = strategy.analyze(entry_df, trend_df)
             signal_type = analysis.get("signal", "HOLD")
 
-            # Ignore HOLD signals; only process BUY or SELL
+            # Only alert on BUY or SELL
             if signal_type in ["BUY", "SELL"]:
                 last_candle_time = str(entry_df.iloc[-1]["time"])
                 cache_key = f"{symbol}_{signal_type}_{last_candle_time}"
 
-                # Avoid sending duplicate alerts for the same candle
                 if last_sent_signals.get(symbol) != cache_key:
                     last_sent_signals[symbol] = cache_key
 
@@ -164,7 +166,13 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
                         f"⚖️ Risk/Reward: `1:{analysis['rr_ratio']}`\n\n"
                         f"📋 **Confluences:**\n{reasons_text}"
                     )
-                    await context.bot.send_message(chat_id=chat_id, text=alert_msg, parse_mode="Markdown")
+
+                    # Send to all users in the chat_ids list
+                    for cid in chat_ids:
+                        try:
+                            await context.bot.send_message(chat_id=cid, text=alert_msg, parse_mode="Markdown")
+                        except Exception as send_err:
+                            logger.error(f"Failed to send alert to chat_id {cid}: {send_err}")
 
         except Exception as e:
             logger.error(f"Auto scan error for {symbol}: {e}")
@@ -195,7 +203,6 @@ def build_app():
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CallbackQueryHandler(button_callback))
 
-    # Enable background auto-scanning
     if getattr(config, "AUTO_SCAN_ENABLED", True):
         job_queue = application.job_queue
         if job_queue:
