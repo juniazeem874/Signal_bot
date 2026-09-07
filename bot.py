@@ -16,50 +16,50 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Cache to avoid duplicate notifications on the same candle
+last_sent_signals = {}
+
 
 async def post_init(application) -> None:
     commands = [
         BotCommand("start", "Show all Forex & Crypto pairs menu"),
         BotCommand("signal", "Get signal for any pair (e.g. /signal BTCUSDT)"),
+        BotCommand("myid", "Get your Telegram Chat ID for auto signals"),
     ]
     await application.bot.set_my_commands(commands)
 
 
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Utility command to get user's Chat ID for config.py"""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"🆔 Your Telegram Chat ID: `{chat_id}`\n\nPaste this in `config.AUTO_SIGNAL_CHAT_ID`.", parse_mode="Markdown")
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menu with ALL major Crypto, Forex, and Metals Pairs."""
     keyboard = [
-        # Major Crypto
         [
             InlineKeyboardButton("⚡ BTC/USDT", callback_data="sig_BTCUSDT"),
             InlineKeyboardButton("💎 ETH/USDT", callback_data="sig_ETHUSDT"),
             InlineKeyboardButton("🚀 SOL/USDT", callback_data="sig_SOLUSDT"),
         ],
-        # Gold & Major Forex
         [
             InlineKeyboardButton("🥇 XAU/USD (Gold)", callback_data="sig_XAU/USD"),
             InlineKeyboardButton("💶 EUR/USD", callback_data="sig_EUR/USD"),
             InlineKeyboardButton("💷 GBP/USD", callback_data="sig_GBP/USD"),
         ],
-        # Forex Crosses
         [
             InlineKeyboardButton("💴 USD/JPY", callback_data="sig_USD/JPY"),
             InlineKeyboardButton("🇨🇦 USD/CAD", callback_data="sig_USD/CAD"),
             InlineKeyboardButton("🇦🇺 AUD/USD", callback_data="sig_AUD/USD"),
-        ],
-        [
-            InlineKeyboardButton("🇨🇭 USD/CHF", callback_data="sig_USD/CHF"),
-            InlineKeyboardButton("🇳🇿 NZD/USD", callback_data="sig_NZD/USD"),
-            InlineKeyboardButton("💶 EUR/GBP", callback_data="sig_EUR/GBP"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg = (
         "⚡ **Institutional Scalping Signal Bot**\n\n"
-        "Click any pair below or type directly:\n"
-        "• `/signal BTCUSDT`\n"
-        "• `/signal EUR/USD`\n"
-        "• `/signal XAU/USD`"
+        "• Manual Signal: Click buttons or use `/signal BTCUSDT`\n"
+        "• Get Chat ID: `/myid`\n"
+        "• Auto-Scanner: Active in background for BUY/SELL setups."
     )
     if update.message:
         await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
@@ -78,7 +78,7 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
         entry_df, trend_df = df_fetcher.get_data(symbol)
 
         if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
-            err_text = f"❌ Could not fetch market data for `{symbol}`. Please check symbol spelling."
+            err_text = f"❌ Could not fetch market data for `{symbol}`."
             if status_msg:
                 await status_msg.edit_text(err_text, parse_mode="Markdown")
             return
@@ -125,6 +125,51 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
             await status_msg.edit_text(f"⚠️ Couldn't get signal for `{symbol}`: {str(e)}", parse_mode="Markdown")
 
 
+async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background task: Scans pairs and sends alerts ONLY on BUY/SELL signals."""
+    chat_id = getattr(config, "AUTO_SIGNAL_CHAT_ID", "")
+    if not chat_id or chat_id == "YOUR_TELEGRAM_CHAT_ID_HERE":
+        return
+
+    pairs = getattr(config, "AUTO_SCAN_PAIRS", ["BTCUSDT", "XAU/USD", "EUR/USD"])
+
+    for symbol in pairs:
+        try:
+            entry_df, trend_df = df_fetcher.get_data(symbol)
+            if entry_df is None or entry_df.empty or trend_df is None or trend_df.empty:
+                continue
+
+            analysis = strategy.analyze(entry_df, trend_df)
+            signal_type = analysis.get("signal", "HOLD")
+
+            # Ignore HOLD signals; only process BUY or SELL
+            if signal_type in ["BUY", "SELL"]:
+                last_candle_time = str(entry_df.iloc[-1]["time"])
+                cache_key = f"{symbol}_{signal_type}_{last_candle_time}"
+
+                # Avoid sending duplicate alerts for the same candle
+                if last_sent_signals.get(symbol) != cache_key:
+                    last_sent_signals[symbol] = cache_key
+
+                    price = analysis.get("price", 0.0)
+                    reasons_text = "\n".join([f"• {r}" for r in analysis.get("reasons", [])])
+                    emoji = "🟢" if signal_type == "BUY" else "🔴"
+
+                    alert_msg = (
+                        f"🚨 **AUTOMATED TRADING SIGNAL** 🚨\n\n"
+                        f"{emoji} **{signal_type} SIGNAL: {symbol}**\n\n"
+                        f"💰 Entry Price: `{price:.5f}`\n"
+                        f"🛑 Stop Loss: `{analysis['stop_loss']:.5f}`\n"
+                        f"🎯 Take Profit: `{analysis['take_profit']:.5f}`\n"
+                        f"⚖️ Risk/Reward: `1:{analysis['rr_ratio']}`\n\n"
+                        f"📋 **Confluences:**\n{reasons_text}"
+                    )
+                    await context.bot.send_message(chat_id=chat_id, text=alert_msg, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"Auto scan error for {symbol}: {e}")
+
+
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Usage: `/signal <SYMBOL>`\nExample: `/signal BTCUSDT`", parse_mode="Markdown")
@@ -147,6 +192,17 @@ def build_app():
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Enable background auto-scanning
+    if getattr(config, "AUTO_SCAN_ENABLED", True):
+        job_queue = application.job_queue
+        if job_queue:
+            job_queue.run_repeating(
+                auto_scan_job,
+                interval=getattr(config, "AUTO_SCAN_INTERVAL", 60),
+                first=10
+            )
 
     return application
