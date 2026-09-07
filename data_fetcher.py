@@ -23,9 +23,7 @@ BINANCE_HOSTS = [
 
 
 def _binance_get(path: str, params: dict) -> dict:
-    """Try each Binance host in order until one responds successfully.
-    Needed because api.binance.com returns HTTP 451 (blocked) from some
-    hosting regions, e.g. certain US-based cloud servers."""
+    """Try each Binance host in order until one responds successfully."""
     last_error = None
     for host in BINANCE_HOSTS:
         try:
@@ -41,8 +39,8 @@ def _binance_get(path: str, params: dict) -> dict:
     raise ConnectionError(f"All Binance endpoints failed. Last error: {last_error}")
 
 
-def get_top_crypto_pairs(n=config.CRYPTO_TOP_N, quote=config.CRYPTO_QUOTE_ASSET):
-    """Return the top N crypto pairs by 24h quote volume, e.g. ['BTCUSDT', ...]."""
+def get_top_crypto_pairs(n=getattr(config, "CRYPTO_TOP_N", 10), quote=getattr(config, "CRYPTO_QUOTE_ASSET", "USDT")):
+    """Return the top N crypto pairs by 24h quote volume."""
     data = _binance_get("/api/v3/ticker/24hr", {})
 
     pairs = [d for d in data if d["symbol"].endswith(quote)]
@@ -50,7 +48,7 @@ def get_top_crypto_pairs(n=config.CRYPTO_TOP_N, quote=config.CRYPTO_QUOTE_ASSET)
     return [p["symbol"] for p in pairs[:n]]
 
 
-def fetch_binance_candles(symbol: str, interval: str, limit: int = config.CANDLE_LIMIT) -> pd.DataFrame:
+def fetch_binance_candles(symbol: str, interval: str, limit: int = getattr(config, "CANDLE_LIMIT", 100)) -> pd.DataFrame:
     """Fetch OHLCV candles for a Binance symbol, e.g. 'BTCUSDT'."""
     params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
     raw = _binance_get("/api/v3/klines", params)
@@ -71,23 +69,21 @@ def fetch_binance_candles(symbol: str, interval: str, limit: int = config.CANDLE
 
 
 # ---------------------------------------------------------------------
-# TWELVEDATA (forex) - free tier: 800 requests/day, 8/min. Be sparing.
+# TWELVEDATA (forex) - free tier: 800 requests/day, 8/min.
 # ---------------------------------------------------------------------
 
 TWELVEDATA_BASE = "https://api.twelvedata.com"
 
-# Our internal interval strings (shared with Binance, which uses '15m', '1h',
-# '4h', etc.) don't all match what TwelveData expects (it wants '15min' for
-# sub-hour intervals). Map them here rather than changing the shared config.
 TWELVEDATA_INTERVAL_MAP = {
     "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "45m": "45min",
     "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1day",
 }
 
 
-def fetch_twelvedata_candles(symbol: str, interval: str, limit: int = config.CANDLE_LIMIT) -> pd.DataFrame:
+def fetch_twelvedata_candles(symbol: str, interval: str, limit: int = getattr(config, "CANDLE_LIMIT", 100)) -> pd.DataFrame:
     """Fetch OHLCV candles for a forex/metal symbol, e.g. 'EUR/USD'."""
-    if not config.TWELVEDATA_API_KEY:
+    api_key = getattr(config, "TWELVEDATA_API_KEY", None)
+    if not api_key:
         raise ValueError("TWELVEDATA_API_KEY is not set. Add it to your environment variables.")
 
     td_interval = TWELVEDATA_INTERVAL_MAP.get(interval, interval)
@@ -97,7 +93,7 @@ def fetch_twelvedata_candles(symbol: str, interval: str, limit: int = config.CAN
         "symbol": symbol.upper(),
         "interval": td_interval,
         "outputsize": limit,
-        "apikey": config.TWELVEDATA_API_KEY,
+        "apikey": api_key,
     }
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
@@ -111,7 +107,6 @@ def fetch_twelvedata_candles(symbol: str, interval: str, limit: int = config.CAN
     df["time"] = pd.to_datetime(df["datetime"])
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
-    # TwelveData forex endpoint often has no real volume; default to 0 if missing
     df["volume"] = df["volume"].astype(float) if "volume" in df.columns else 0.0
 
     df = df.sort_values("time").reset_index(drop=True)
@@ -119,29 +114,39 @@ def fetch_twelvedata_candles(symbol: str, interval: str, limit: int = config.CAN
 
 
 # ---------------------------------------------------------------------
-# Unified interface
+# Unified Interface & Strategy Wrappers
 # ---------------------------------------------------------------------
 
 def is_forex_symbol(symbol: str) -> bool:
-    """Forex/metal symbols contain a slash, e.g. 'EUR/USD'. Crypto ones don't, e.g. 'BTCUSDT'."""
+    """Forex/metal symbols contain a slash (EUR/USD), crypto symbols do not (BTCUSDT)."""
     return "/" in symbol
 
 
-def fetch_candles(symbol: str, interval: str, limit: int = config.CANDLE_LIMIT) -> pd.DataFrame:
+def fetch_candles(symbol: str, interval: str, limit: int = getattr(config, "CANDLE_LIMIT", 100)) -> pd.DataFrame:
     """Route to the correct data source based on the symbol format."""
     if is_forex_symbol(symbol):
         return fetch_twelvedata_candles(symbol, interval, limit)
     return fetch_binance_candles(symbol, interval, limit)
 
 
-def fetch_multi_timeframe(symbol: str, timeframes: list, limit: int = config.CANDLE_LIMIT) -> dict:
-    """Fetch candles for several timeframes of the same symbol.
-    Returns {timeframe: dataframe}. Used for top-down multi-timeframe analysis."""
+def fetch_multi_timeframe(symbol: str, timeframes: list, limit: int = getattr(config, "CANDLE_LIMIT", 100)) -> dict:
+    """Fetch candles for several timeframes of the same symbol."""
     return {tf: fetch_candles(symbol, tf, limit) for tf in timeframes}
 
-# Function naming mismatch handle karne ke liye wrappers
-if "get_data" in globals():
-    getdata = get_data
-if "getdata" in globals():
-    get_data = getdata
 
+def get_data(symbol: str):
+    """
+    Main method required by bot.py to fetch 1m (LTF Entry) 
+    and 15m (HTF Trend) data simultaneously.
+    """
+    entry_tf = getattr(config, "ENTRY_TIMEFRAME", "1m")
+    trend_tf = getattr(config, "TREND_TIMEFRAME", "15m")
+
+    entry_df = fetch_candles(symbol, entry_tf)
+    trend_df = fetch_candles(symbol, trend_tf)
+
+    return entry_df, trend_df
+
+
+# Naming Aliases so bot.py works with get_data or getdata
+getdata = get_data
