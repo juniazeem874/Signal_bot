@@ -183,3 +183,53 @@ def volume_spike_confirms(df: pd.DataFrame) -> bool:
     if pd.isna(prev_sma) or prev_sma == 0:
         return False
     return last["volume"] >= prev_sma * config.VOL_SPIKE_MULTIPLIER
+    def detect_rejection_candle(df: pd.DataFrame) -> str:
+    """
+    Detects long-wick Pinbar/Rejection candles.
+    Lower wick >= 55% of total candle length -> Bullish Rejection (Demand response).
+    Upper wick >= 55% of total candle length -> Bearish Rejection (Supply response).
+    """
+    if len(df) < 1:
+        return "none"
+    curr = df.iloc[-1]
+    candle_range = curr["high"] - curr["low"]
+    if candle_range == 0:
+        return "none"
+
+    body = abs(curr["close"] - curr["open"])
+    upper_wick = curr["high"] - max(curr["open"], curr["close"])
+    lower_wick = min(curr["open"], curr["close"]) - curr["low"]
+
+    if lower_wick / candle_range >= 0.55 and body / candle_range <= 0.35:
+        return "bullish_rejection"
+    if upper_wick / candle_range >= 0.55 and body / candle_range <= 0.35:
+        return "bearish_rejection"
+    return "none"
+
+
+def detect_fake_breakout(df: pd.DataFrame, lookback=15) -> str:
+    """
+    Detects Fake Breakouts (Liquidity Grab / Traps):
+    - Bull Trap (Bearish Fakeout): Price breaks recent high but closes back inside range.
+    - Bear Trap (Bullish Fakeout): Price breaks recent low but closes back inside range.
+    """
+    if len(df) < lookback + 1:
+        return "none"
+    recent = df.tail(lookback + 1)
+    prior = recent.iloc[:-1]
+    curr = recent.iloc[-1]
+
+    prior_high = prior["high"].max()
+    prior_low = prior["low"].min()
+
+    # Bear Trap: Low todi lekin candle close level ke upar hui (Bullish Signal)
+    if curr["low"] < prior_low and curr["close"] > prior_low:
+        return "bullish_fakeout"
+
+    # Bull Trap: High toda lekin candle close level ke niche hui (Bearish Signal)
+    if curr["high"] > prior_high and curr["close"] < prior_high:
+        return "bearish_fakeout"
+
+    return "none"
+
+    
