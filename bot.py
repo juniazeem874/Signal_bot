@@ -74,15 +74,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     keyboard = [
-        # Auto Signal Control Button
         [toggle_button],
-        # Major Crypto
         [
             InlineKeyboardButton("⚡ BTC/USDT", callback_data="sig_BTCUSDT"),
             InlineKeyboardButton("💎 ETH/USDT", callback_data="sig_ETHUSDT"),
             InlineKeyboardButton("🚀 SOL/USDT", callback_data="sig_SOLUSDT"),
         ],
-        # Metals & Forex
         [
             InlineKeyboardButton("🥇 XAU/USD (Gold)", callback_data="sig_XAU/USD"),
             InlineKeyboardButton("💶 EUR/USD", callback_data="sig_EUR/USD"),
@@ -97,9 +94,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg = (
-        f"⚡ **Institutional Scalping Signal Bot**\n\n"
+        f"⚡ **Institutional AI Scalping Bot**\n\n"
         f"🤖 **Auto-Signal Status:** `{status_str}`\n\n"
-        f"• Toggle Auto Signal: Use buttons above or commands `/autoon` / `/autooff`\n"
+        f"• Toggle Auto Signal: Use buttons above or `/autoon` / `/autooff`\n"
         f"• Manual Check: Click pair buttons or type `/signal BTCUSDT`\n"
         f"• Get Chat ID: `/myid`"
     )
@@ -114,9 +111,9 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
     status_msg = None
     try:
         if update.message:
-            status_msg = await update.message.reply_text(f"⏳ Analyzing `{symbol}`...", parse_mode="Markdown")
+            status_msg = await update.message.reply_text(f"⏳ Analyzing `{symbol}` with AI...", parse_mode="Markdown")
         elif update.callback_query:
-            status_msg = await update.callback_query.message.reply_text(f"⏳ Analyzing `{symbol}`...", parse_mode="Markdown")
+            status_msg = await update.callback_query.message.reply_text(f"⏳ Analyzing `{symbol}` with AI...", parse_mode="Markdown")
 
         entry_df, trend_df = df_fetcher.get_data(symbol)
 
@@ -126,7 +123,8 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
                 await status_msg.edit_text(err_text, parse_mode="Markdown")
             return
 
-        analysis = strategy.analyze(entry_df, trend_df)
+        # FIXED: Added await here
+        analysis = await strategy.analyze(entry_df, trend_df, symbol)
         signal_type = analysis.get("signal", "HOLD")
         price = analysis.get("price", 0.0)
 
@@ -138,7 +136,7 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
                 f"🛑 Stop Loss: `{analysis['stop_loss']:.5f}`\n"
                 f"🎯 Take Profit: `{analysis['take_profit']:.5f}`\n"
                 f"⚖️ Risk/Reward: `1:{analysis['rr_ratio']}`\n\n"
-                f"📋 **Confluences:**\n{reasons_text}"
+                f"📋 **Analysis:**\n{reasons_text}"
             )
         elif signal_type == "SELL":
             reasons_text = "\n".join([f"• {r}" for r in analysis.get("reasons", [])])
@@ -148,7 +146,7 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
                 f"🛑 Stop Loss: `{analysis['stop_loss']:.5f}`\n"
                 f"🎯 Take Profit: `{analysis['take_profit']:.5f}`\n"
                 f"⚖️ Risk/Reward: `1:{analysis['rr_ratio']}`\n\n"
-                f"📋 **Confluences:**\n{reasons_text}"
+                f"📋 **Analysis:**\n{reasons_text}"
             )
         else:
             reason = analysis['reasons'][0] if analysis.get('reasons') else "No setup found."
@@ -182,7 +180,6 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     for symbol in pairs:
         try:
-            # Re-check inside loop in case it was toggled OFF mid-scan
             if not AUTO_SCAN_ACTIVE:
                 break
 
@@ -190,7 +187,8 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
             if entry_df is None or entry_df.empty or trend_df is None or trend_df.empty:
                 continue
 
-            analysis = strategy.analyze(entry_df, trend_df)
+            # FIXED: Added await here
+            analysis = await strategy.analyze(entry_df, trend_df, symbol)
             signal_type = analysis.get("signal", "HOLD")
 
             if signal_type in ["BUY", "SELL"]:
@@ -205,13 +203,13 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
                     emoji = "🟢" if signal_type == "BUY" else "🔴"
 
                     alert_msg = (
-                        f"🚨 **AUTOMATED TRADING SIGNAL** 🚨\n\n"
+                        f"🚨 **AUTOMATED AI TRADING SIGNAL** 🚨\n\n"
                         f"{emoji} **{signal_type} SIGNAL: {symbol}**\n\n"
                         f"💰 Entry Price: `{price:.5f}`\n"
                         f"🛑 Stop Loss: `{analysis['stop_loss']:.5f}`\n"
                         f"🎯 Take Profit: `{analysis['take_profit']:.5f}`\n"
                         f"⚖️ Risk/Reward: `1:{analysis['rr_ratio']}`\n\n"
-                        f"📋 **Confluences:**\n{reasons_text}"
+                        f"📋 **Analysis:**\n{reasons_text}"
                     )
 
                     for cid in chat_ids:
@@ -259,7 +257,6 @@ def build_app():
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CallbackQueryHandler(button_callback))
 
-    # Enable background job queue
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(
