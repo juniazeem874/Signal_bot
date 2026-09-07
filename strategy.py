@@ -3,7 +3,7 @@ import indicators as ind
 import ai_analyzer
 
 
-def analyze(entry_df, trend_df, symbol="UNKNOWN"):
+async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
     entry_df = ind.add_atr(entry_df)
     entry_df = ind.add_volume_sma(entry_df, period=20)
 
@@ -32,14 +32,14 @@ def analyze(entry_df, trend_df, symbol="UNKNOWN"):
         "last_price": last_price,
         "htf_bias": htf_bias,
         "patterns": patterns if patterns else ["None"],
-        "volume_status": "Above 20-SMA Spike" if has_volume_confirm else "Below Average / Low",
+        "volume_status": "Spike > 20 SMA" if has_volume_confirm else "Normal",
         "swing_high": swing_high,
         "swing_low": swing_low,
         "golden_pocket": "Bullish GP" if in_gp_bull else ("Bearish GP" if in_gp_bear else "None")
     }
 
-    # ---- Try AI Analysis First ----
-    ai_result = ai_analyzer.analyze_market_with_ai(symbol, market_summary)
+    # ---- Async Gemini AI Call ----
+    ai_result = await ai_analyzer.analyze_market_with_ai(symbol, market_summary)
 
     if ai_result and "signal" in ai_result:
         signal = ai_result.get("signal", "HOLD").upper()
@@ -48,30 +48,30 @@ def analyze(entry_df, trend_df, symbol="UNKNOWN"):
             "trend_bias": htf_bias,
             "signal": signal,
             "confidence": ai_result.get("confidence", 70),
-            "reasons": [f"[AI Insights] {r}" for r in ai_result.get("reasons", [])],
+            "reasons": [f"🤖 [AI] {r}" for r in ai_result.get("reasons", [])],
             "stop_loss": ai_result.get("stop_loss") if signal != "HOLD" else None,
             "take_profit": ai_result.get("take_profit") if signal != "HOLD" else None,
             "rr_ratio": config.MIN_RISK_REWARD,
         }
 
-    # ---- Fallback Rule-Based Strategy ----
+    # ---- Fallback Technical Logic ----
     bull_score = 0
     bear_score = 0
     bull_reasons, bear_reasons = [], []
 
-    if htf_bias == "bullish": bull_score += 1; bull_reasons.append("15m HTF Trend is Bullish")
-    if in_gp_bull: bull_score += 1; bull_reasons.append("Price in Golden Pocket Retracement")
+    if htf_bias == "bullish": bull_score += 1; bull_reasons.append("15m Trend Bullish")
+    if in_gp_bull: bull_score += 1; bull_reasons.append("Golden Pocket Retracement")
     if engulfing == "bullish_engulfing" or marubozu == "bullish_marubozu":
         if has_volume_confirm:
             bull_score += 1.5
-            bull_reasons.append("Bullish Momentum + 20-SMA Volume Spike")
+            bull_reasons.append("Momentum + Volume Spike")
 
-    if htf_bias == "bearish": bear_score += 1; bear_reasons.append("15m HTF Trend is Bearish")
-    if in_gp_bear: bear_score += 1; bear_reasons.append("Price in Golden Pocket Retracement")
+    if htf_bias == "bearish": bear_score += 1; bear_reasons.append("15m Trend Bearish")
+    if in_gp_bear: bear_score += 1; bear_reasons.append("Golden Pocket Retracement")
     if engulfing == "bearish_engulfing" or marubozu == "bearish_marubozu":
         if has_volume_confirm:
             bear_score += 1.5
-            bear_reasons.append("Bearish Momentum + 20-SMA Volume Spike")
+            bear_reasons.append("Momentum + Volume Spike")
 
     min_score = getattr(config, "MIN_SCORE_FOR_SIGNAL", 2)
 
@@ -107,7 +107,7 @@ def analyze(entry_df, trend_df, symbol="UNKNOWN"):
         "trend_bias": htf_bias,
         "signal": "HOLD",
         "confidence": 0,
-        "reasons": ["No momentum breakout aligned with AI or technical parameters."],
+        "reasons": ["No momentum breakout detected."],
         "stop_loss": None,
         "take_profit": None,
         "rr_ratio": None,
