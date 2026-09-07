@@ -141,3 +141,14 @@ def volume_confirms(df: pd.DataFrame, direction: str) -> bool:
     if direction == "bearish":
         return is_spike and not bullish_candle
     return False
+
+def addvolumesma(df: pd.DataFrame, period=20) -> pd.DataFrame:
+    """Volume Moving Average calculate karta hai (strategy.py ke liye compatibility wrapper)."""
+    df = df.copy()
+    df["vol_avg"] = df["volume"].rolling(period).mean()
+    df["vol_sma"] = df["vol_avg"]
+    return df
+
+# Alias taaki dono names work karein
+add_volume_sma = addvolumesma
+add_volume_avg = addvolumesma
