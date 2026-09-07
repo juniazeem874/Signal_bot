@@ -6,91 +6,37 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # ---- TwelveData (forex) ----
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 
-# ---- Multi-timeframe strategy (top-down analysis) ----
-# Ordered from Highest Time Frame (HTF, sets the trend bias) down to the
-# entry timeframe (last in the list = where BOS/FVG/Fibonacci/volume are
-# checked for the actual trigger). This mirrors how institutional/SMC
-# traders actually work: higher frames set direction, lower frames time
-# the entry.
-#
-# Crypto (Binance) has no meaningful rate limit for this, so it gets the
-# full stack down to 1m. Forex (TwelveData free tier = 800 requests/day,
-# 8/min) stops at 15m — adding 5m/1m would multiply API calls per signal
-# check and burn through the daily quota fast.
-MTF_STACK_CRYPTO = ["4h", "1h", "15m", "5m", "1m"]
-MTF_STACK_FOREX = ["4h", "1h", "15m"]
+# ---- PDF Scalping Strategy Timeframes ----
+ENTRY_INTERVAL_BINANCE = "1m"      # LTF Execution (1-Minute)
+TREND_INTERVAL_BINANCE = "15m"     # HTF Anchor (15-Minute)
 
-# Out of 3 possible entry-timeframe checks (BOS, FVG/Fibonacci zone, Volume),
-# how many must agree — on top of the higher-timeframe stack already having
-# to align — before a BUY/SELL fires.
-MTF_MIN_ENTRY_SCORE = 2
+ENTRY_INTERVAL_TWELVEDATA = "1m"   # LTF Execution
+TREND_INTERVAL_TWELVEDATA = "15m"  # HTF Anchor
 
-CANDLE_LIMIT = 200  # how many candles to pull for indicator calculation
+CANDLE_LIMIT = 500  # Pull candles for VWAP & Fibonacci calculation
 
-# ---- Risk management ----
+# ---- Signal Scoring Thresholds ----
+MIN_SCORE_FOR_SIGNAL = 3  # Out of 4 confluence checks needed
+
+# ---- Fibonacci Golden Pocket Matrix ----
+FIB_GOLDEN_POCKET_LOW = 0.618
+FIB_GOLDEN_POCKET_HIGH = 0.705
+
+# ---- Volume Confirmation (PDF Rules) ----
+VOL_SMA_PERIOD = 5
+VOL_SPIKE_MULTIPLIER = 1.5  # Must be 1.5x preceding 5-candle SMA
+
+# ---- Risk Management (PDF Rules) ----
+MIN_RISK_REWARD = 2.5       # Baseline 1:2.5 RR
+BREAKEVEN_RR = 1.5          # RR to move SL to Breakeven
+SL_BUFFER_PERCENT = 0.0005  # Extra buffer beyond Fib 1.0 level (~2 pips equivalent)
 ATR_PERIOD = 14
-SL_ATR_MULTIPLIER = 1.5   # default, used for any symbol not listed below
-TP_ATR_MULTIPLIER = 3.0   # default, used for any symbol not listed below
 
-# Per-asset overrides: some instruments (gold, BTC) whip around more than
-# altcoins/majors on the same timeframe, so a stop that's too tight just gets
-# clipped by noise before the real move happens. These starting points widen
-# the stop (and target) for those symbols — re-run /backtest after any change
-# here to confirm it actually helped, don't assume it did.
-ASSET_RISK_OVERRIDES = {
-    "BTCUSDT": {"sl_mult": 2.2, "tp_mult": 3.5},
-    "XAU/USD": {"sl_mult": 2.5, "tp_mult": 4.0},
-    "XAG/USD": {"sl_mult": 2.5, "tp_mult": 4.0},
-    "GBP/USD": {"sl_mult": 2.0, "tp_mult": 3.5},  # "Cable" — sharper moves than EUR/USD, tight SL got stopped out too often (20.4% WR at default 1.5x)
-}
-
-
-def get_risk_params(symbol: str):
-    """Returns (sl_multiplier, tp_multiplier) for a symbol, falling back to
-    the defaults above if it has no specific override."""
-    if symbol:
-        override = ASSET_RISK_OVERRIDES.get(symbol.upper())
-        if override:
-            return override["sl_mult"], override["tp_mult"]
-    return SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER
-
-
-# ---- Break of Structure tuning ----
-# lookback = how many candles define "the recent structure" to break.
-# margin_mult = how far past that level (in units of ATR) price must close
-# before it counts as a real break, not noise. Gold especially fakes out
-# past minor levels before reversing, so it gets a wider lookback (a more
-# meaningful level to break) and a bigger margin (filters the small pokes).
-BOS_DEFAULT_LOOKBACK = 30
-BOS_DEFAULT_MARGIN_MULT = 0.15
-
-BOS_OVERRIDES = {
-    "XAU/USD": {"lookback": 45, "margin_mult": 0.35},
-    "XAG/USD": {"lookback": 45, "margin_mult": 0.35},
-    "BTCUSDT": {"lookback": 30, "margin_mult": 0.20},
-}
-
-
-def get_bos_params(symbol: str):
-    """Returns (lookback, margin_mult) for a symbol, falling back to defaults."""
-    if symbol:
-        override = BOS_OVERRIDES.get(symbol.upper())
-        if override:
-            return override["lookback"], override["margin_mult"]
-    return BOS_DEFAULT_LOOKBACK, BOS_DEFAULT_MARGIN_MULT
-
-# ---- Crypto pair list (Binance) ----
-# "All pairs" via Binance is technically possible (1000+), but for usability
-# we show the top pairs by 24h volume dynamically, plus support typing any
-# symbol directly (e.g. /signal DOGEUSDT).
+# ---- Crypto Pair List (Binance) ----
 CRYPTO_QUOTE_ASSET = "USDT"
 CRYPTO_TOP_N = 30
 
-# ---- Forex pair list (TwelveData free tier) ----
-# TwelveData free tier = 800 requests/day, 8/min. "All" forex pairs would
-# blow through that fast if polled continuously, so we ship a comprehensive
-# major + minor + metals list here, and also support typing any symbol
-# directly (e.g. /signal USDCHF).
+# ---- Forex Pair List (TwelveData) ----
 FOREX_PAIRS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "USD/CAD", "AUD/USD", "NZD/USD",
     "EUR/GBP", "EUR/JPY", "EUR/CHF", "EUR/AUD", "EUR/CAD",
