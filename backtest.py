@@ -1,16 +1,5 @@
 """
-Backtests the multi-timeframe strategy in strategy.py on historical candles.
-
-Fetches each timeframe in the stack directly (not resampled), then walks
-forward on the entry (lowest) timeframe candle-by-candle. At each step, every
-higher timeframe is cut off at the current candle's timestamp so the
-strategy only ever sees what would have been known at that moment (no
-lookahead). Whenever it would have signaled BUY/SELL, the trade is
-simulated forward to see whether Stop Loss or Take Profit was hit first.
-
-Usage:
-    python backtest.py --symbol BTCUSDT --limit 1000
-    python backtest.py --symbol "EUR/USD" --limit 500
+Backtests the Institutional Multi-Confluence Scalping Strategy on historical candles.
 """
 
 import argparse
@@ -21,16 +10,27 @@ import config
 import data_fetcher as dfetch
 import strategy
 
-WARMUP_CANDLES = 40  # entry timeframe needs some history for ATR/swing/BOS lookback
-MIN_HIGHER_TF_CANDLES = 5  # don't trust a higher timeframe bias off fewer than this
+WARMUP_CANDLES = 100
+
+INTERVAL_TO_PANDAS_RULE = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "4h": "4h", "1d": "1d",
+}
+
+
+def resample_ohlcv(df: pd.DataFrame, target_interval: str) -> pd.DataFrame:
+    rule = INTERVAL_TO_PANDAS_RULE.get(target_interval, target_interval)
+    resampled = (
+        df.set_index("time")
+        .resample(rule)
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna()
+        .reset_index()
+    )
+    return resampled
 
 
 def simulate_trade(df: pd.DataFrame, entry_idx: int, result: dict, max_hold: int):
-    """
-    Walk forward from entry_idx+1 checking each candle's high/low against
-    SL/TP. Conservative assumption: if a single candle touches both SL and
-    TP, SL is assumed to hit first (worst case).
-    """
     direction = result["signal"]
     entry_price = result["price"]
     sl = result["stop_loss"]
@@ -63,67 +63,49 @@ def simulate_trade(df: pd.DataFrame, entry_idx: int, result: dict, max_hold: int
     return {"outcome": outcome, "r_multiple": r, "exit_index": end_idx, "exit_reason": "timeout"}
 
 
-def run_backtest(symbol: str, stack: list, limit: int, max_hold: int):
-    entry_tf = stack[-1]
-    higher_tfs = stack[:-1]
+def run_backtest(symbol: str, entry_interval: str, trend_interval: str, limit: int, max_hold: int):
+    print(f"Fetching {limit} candles for {symbol} ({entry_interval})...")
+    df = dfetch.fetch_candles(symbol, entry_interval, limit=limit)
+    df = df.reset_index(drop=True)
 
-    print(f"Fetching multi-timeframe data for {symbol}: {stack}")
-    dfs_full = {}
-    dfs_full[entry_tf] = dfetch.fetch_candles(symbol, entry_tf, limit=limit).reset_index(drop=True)
-    for tf in higher_tfs:
-        # Higher timeframes get at least 250 candles regardless of --limit,
-        # so EMA200-based bias has enough history even if --limit is small.
-        dfs_full[tf] = dfetch.fetch_candles(symbol, tf, limit=max(limit, 250)).reset_index(drop=True)
+    if len(df) < WARMUP_CANDLES + 10:
+        raise ValueError(f"Not enough candles ({len(df)}) for backtest. Need at least {WARMUP_CANDLES + 10}.")
 
-    entry_full = dfs_full[entry_tf]
-    if len(entry_full) < WARMUP_CANDLES + 20:
-        raise ValueError(
-            f"Not enough entry-timeframe candles ({len(entry_full)}) for a meaningful backtest. "
-            f"Need at least {WARMUP_CANDLES + 20}."
-        )
-
-    higher_times = {tf: dfs_full[tf]["time"].values for tf in higher_tfs}
+    trend_full = resample_ohlcv(df, trend_interval)
+    trend_times = trend_full["time"].values
 
     trades = []
     i = WARMUP_CANDLES
-    while i < len(entry_full) - 1:
-        current_time = entry_full.iloc[i]["time"]
+    while i < len(df) - 1:
+        current_time = df.iloc[i]["time"]
+        cutoff = np.searchsorted(trend_times, np.datetime64(current_time), side="right")
+        trend_slice = trend_full.iloc[:cutoff]
 
-        dfs_slice = {entry_tf: entry_full.iloc[:i + 1]}
-        enough_history = True
-        for tf in higher_tfs:
-            cutoff = np.searchsorted(higher_times[tf], np.datetime64(current_time), side="right")
-            if cutoff < MIN_HIGHER_TF_CANDLES:
-                enough_history = False
-                break
-            dfs_slice[tf] = dfs_full[tf].iloc[:cutoff]
-
-        if not enough_history:
+        if len(trend_slice) < 5:
             i += 1
             continue
 
-        result = strategy.analyze_mtf(dfs_slice, stack, symbol=symbol)
+        entry_slice = df.iloc[:i + 1]
+        result = strategy.analyze(entry_slice.copy(), trend_slice.copy())
 
         if result["signal"] in ("BUY", "SELL"):
-            trade = simulate_trade(entry_full, i, result, max_hold)
+            trade = simulate_trade(df, i, result, max_hold)
             trade["entry_index"] = i
-            trade["entry_time"] = str(entry_full.iloc[i]["time"])
+            trade["entry_time"] = str(df.iloc[i]["time"])
             trade["direction"] = result["signal"]
             trade["confidence"] = result["confidence"]
             trades.append(trade)
-            i = trade["exit_index"] + 1  # one trade at a time, resume after it closes
+            i = trade["exit_index"] + 1
         else:
             i += 1
 
     return trades
 
 
-def build_report_text(trades, symbol) -> str:
+def print_report(trades, symbol):
     if not trades:
-        return (
-            f"No trades were triggered for {symbol} in this data range.\n"
-            f"Try a longer limit, or a different pair/timeframe."
-        )
+        print(f"\nNo trades were triggered for {symbol} in this data range.")
+        return
 
     n = len(trades)
     wins = [t for t in trades if t["outcome"] == "win"]
@@ -141,45 +123,23 @@ def build_report_text(trades, symbol) -> str:
     drawdown = running_max - equity
     max_dd = drawdown.max() if len(drawdown) else 0
 
-    lines = [
-        f"Backtest report: {symbol}",
-        f"Total trades: {n}",
-        f"Wins / Losses: {len(wins)} / {len(losses)}",
-        f"Win rate: {win_rate:.1f}%",
-        f"Profit factor: {profit_factor:.2f}",
-        f"Avg R per trade: {avg_r:.2f}",
-        f"Total R: {equity[-1]:.2f}",
-        f"Max drawdown: {max_dd:.2f}R",
-        "",
-        "Note: fixed R risk-reward from config.py's ATR multipliers.",
-        "Past performance does not guarantee future results.",
-    ]
-    return "\n".join(lines)
-
-
-def print_report(trades, symbol):
-    print("\n" + build_report_text(trades, symbol) + "\n")
-
-
-def save_trades_csv(trades, path):
-    if not trades:
-        return
-    pd.DataFrame(trades).to_csv(path, index=False)
-    print(f"\nTrade log saved to {path}")
+    print(f"\n===== Backtest Report (PDF Scalping Strategy): {symbol} =====")
+    print(f"Total trades:     {n}")
+    print(f"Wins / Losses:    {len(wins)} / {len(losses)}")
+    print(f"Win rate:         {win_rate:.1f}%")
+    print(f"Profit factor:    {profit_factor:.2f}")
+    print(f"Avg R per trade:  {avg_r:.2f}")
+    print(f"Total R:          {equity[-1]:.2f}")
+    print(f"Max drawdown:     {max_dd:.2f}R")
+    print("=============================================================")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backtest the multi-timeframe SMC+Fib+Volume strategy")
-    parser.add_argument("--symbol", required=True, help="e.g. BTCUSDT or 'EUR/USD'")
-    parser.add_argument("--limit", type=int, default=1000, help="number of entry-timeframe candles to fetch")
-    parser.add_argument("--max-hold", type=int, default=100, help="max candles to hold a trade before timeout")
-    parser.add_argument("--csv", default=None, help="optional path to save the trade log as CSV")
+    parser = argparse.ArgumentParser(description="Backtest Institutional Multi-Confluence Scalping Strategy")
+    parser.add_argument("--symbol", required=True, help="e.g. BTCUSDT, EUR/USD, XAU/USD")
+    parser.add_argument("--limit", type=int, default=1000, help="Candles to fetch")
+    parser.add_argument("--max-hold", type=int, default=60, help="Max 1m candles to hold trade")
     args = parser.parse_args()
 
-    is_forex = dfetch.is_forex_symbol(args.symbol)
-    stack = config.MTF_STACK_FOREX if is_forex else config.MTF_STACK_CRYPTO
-
-    trades = run_backtest(args.symbol, stack, args.limit, args.max_hold)
+    trades = run_backtest(args.symbol, "1m", "15m", args.limit, args.max_hold)
     print_report(trades, args.symbol)
-    if args.csv:
-        save_trades_csv(trades, args.csv)
