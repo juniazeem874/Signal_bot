@@ -10,7 +10,6 @@ import data_fetcher as df_fetcher
 import strategy
 import config
 
-# Logging setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -19,38 +18,48 @@ logger = logging.getLogger(__name__)
 
 
 async def post_init(application) -> None:
-    """Bot start hote hi Telegram menu mein `/start`, `/signal`, aur `/backtest` set kar dega."""
     commands = [
-        BotCommand("start", "Start the bot & open interactive menu"),
-        BotCommand("signal", "Get trading signal (e.g. /signal BTCUSDT)"),
-        BotCommand("backtest", "Run backtest (e.g. /backtest BTCUSDT 1000)"),
+        BotCommand("start", "Show all Forex & Crypto pairs menu"),
+        BotCommand("signal", "Get signal for any pair (e.g. /signal BTCUSDT)"),
     ]
     await application.bot.set_my_commands(commands)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/start command handler with quick buttons."""
+    """Menu with ALL major Crypto, Forex, and Metals Pairs."""
     keyboard = [
+        # Major Crypto
         [
             InlineKeyboardButton("⚡ BTC/USDT", callback_data="sig_BTCUSDT"),
-            InlineKeyboardButton("💶 EUR/USD", callback_data="sig_EUR/USD"),
+            InlineKeyboardButton("💎 ETH/USDT", callback_data="sig_ETHUSDT"),
+            InlineKeyboardButton("🚀 SOL/USDT", callback_data="sig_SOLUSDT"),
         ],
+        # Gold & Major Forex
         [
+            InlineKeyboardButton("🥇 XAU/USD (Gold)", callback_data="sig_XAU/USD"),
+            InlineKeyboardButton("💶 EUR/USD", callback_data="sig_EUR/USD"),
             InlineKeyboardButton("💷 GBP/USD", callback_data="sig_GBP/USD"),
+        ],
+        # Forex Crosses
+        [
+            InlineKeyboardButton("💴 USD/JPY", callback_data="sig_USD/JPY"),
+            InlineKeyboardButton("🇨🇦 USD/CAD", callback_data="sig_USD/CAD"),
             InlineKeyboardButton("🇦🇺 AUD/USD", callback_data="sig_AUD/USD"),
         ],
         [
-            InlineKeyboardButton("💵 USD/CHF", callback_data="sig_USD/CHF"),
-            InlineKeyboardButton("🥇 XAU/USD (Gold)", callback_data="sig_XAU/USD"),
+            InlineKeyboardButton("🇨🇭 USD/CHF", callback_data="sig_USD/CHF"),
+            InlineKeyboardButton("🇳🇿 NZD/USD", callback_data="sig_NZD/USD"),
+            InlineKeyboardButton("💶 EUR/GBP", callback_data="sig_EUR/GBP"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg = (
-        "👋 **Trading Signal & Backtest Bot**\n\n"
-        "Select a market below or run direct commands:\n"
-        "• `/signal BTCUSDT` or `/signal EUR/USD`\n"
-        "• `/backtest BTCUSDT 1000`"
+        "⚡ **Institutional Scalping Signal Bot**\n\n"
+        "Click any pair below or type directly:\n"
+        "• `/signal BTCUSDT`\n"
+        "• `/signal EUR/USD`\n"
+        "• `/signal XAU/USD`"
     )
     if update.message:
         await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
@@ -66,16 +75,14 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
         elif update.callback_query:
             status_msg = await update.callback_query.message.reply_text(f"⏳ Analyzing `{symbol}`...", parse_mode="Markdown")
 
-        # Fetch 1m LTF and 15m HTF data
         entry_df, trend_df = df_fetcher.get_data(symbol)
 
         if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
-            err_text = f"❌ Could not fetch market data for `{symbol}`. Please check symbol or API."
+            err_text = f"❌ Could not fetch market data for `{symbol}`. Please check symbol spelling."
             if status_msg:
                 await status_msg.edit_text(err_text, parse_mode="Markdown")
             return
 
-        # Execute strategy analysis
         analysis = strategy.analyze(entry_df, trend_df)
         signal_type = analysis.get("signal", "HOLD")
         price = analysis.get("price", 0.0)
@@ -101,11 +108,11 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
                 f"📋 **Confluences:**\n{reasons_text}"
             )
         else:
-            reason = analysis['reasons'][0] if analysis.get('reasons') else "Market structure neutral."
+            reason = analysis['reasons'][0] if analysis.get('reasons') else "No setup found."
             out_msg = (
                 f"🟡 **HOLD / NO SETUP: {symbol}**\n\n"
                 f"💰 Current Price: `{price:.5f}`\n"
-                f"📊 HTF Trend Bias: `{analysis.get('trend_bias', 'neutral').upper()}`\n"
+                f"📊 HTF Trend: `{analysis.get('trend_bias', 'neutral').upper()}`\n"
                 f"ℹ️ {reason}"
             )
 
