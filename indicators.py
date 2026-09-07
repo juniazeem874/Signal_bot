@@ -41,6 +41,18 @@ def add_volume_avg(df: pd.DataFrame, period=20) -> pd.DataFrame:
     return df
 
 
+def addvolumesma(df: pd.DataFrame, period=20) -> pd.DataFrame:
+    """Volume Moving Average calculate karta hai (strategy.py compatibility wrapper)."""
+    df = df.copy()
+    df["vol_avg"] = df["volume"].rolling(period).mean()
+    df["vol_sma"] = df["vol_avg"]
+    return df
+
+
+# Aliases for Volume SMA
+add_volume_sma = addvolumesma
+
+
 def get_trend_bias(df: pd.DataFrame) -> str:
     """'bullish', 'bearish', or 'neutral' based on EMA50/200 + price position."""
     last = df.iloc[-1]
@@ -51,6 +63,17 @@ def get_trend_bias(df: pd.DataFrame) -> str:
     if last["ema_fast"] < last["ema_slow"] and last["close"] < last["ema_fast"]:
         return "bearish"
     return "neutral"
+
+
+def gethtfbias(df: pd.DataFrame) -> str:
+    """Higher Timeframe (HTF) bias calculate karta hai (strategy.py helper)."""
+    if "ema_fast" not in df.columns or "ema_slow" not in df.columns:
+        df = add_adaptive_emas(df)
+    return get_trend_bias(df)
+
+
+# Aliases for HTF Bias
+get_htf_bias = gethtfbias
 
 
 def find_last_swing(df: pd.DataFrame, lookback=30, window=3):
@@ -141,14 +164,3 @@ def volume_confirms(df: pd.DataFrame, direction: str) -> bool:
     if direction == "bearish":
         return is_spike and not bullish_candle
     return False
-
-def addvolumesma(df: pd.DataFrame, period=20) -> pd.DataFrame:
-    """Volume Moving Average calculate karta hai (strategy.py ke liye compatibility wrapper)."""
-    df = df.copy()
-    df["vol_avg"] = df["volume"].rolling(period).mean()
-    df["vol_sma"] = df["vol_avg"]
-    return df
-
-# Alias taaki dono names work karein
-add_volume_sma = addvolumesma
-add_volume_avg = addvolumesma
