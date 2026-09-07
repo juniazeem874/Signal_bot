@@ -44,3 +44,18 @@ FOREX_PAIRS = [
     "AUD/JPY", "AUD/NZD", "AUD/CAD", "CAD/JPY", "CHF/JPY", "NZD/JPY",
     "XAU/USD", "XAG/USD",
 ]
+# --- AUTO SIGNAL SCANNER SETTINGS ---
+AUTO_SCAN_ENABLED = True
+AUTO_SCAN_INTERVAL = 60  # Har 60 seconds (1 minute) baad scan karega
+
+# Aapka Telegram Chat ID (Is par auto signals aayenge)
+# Get ID by messaging @userinfobot on Telegram
+AUTO_SIGNAL_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID_HERE" 
+
+# Auto-scan kiye jaane wale pairs
+AUTO_SCAN_PAIRS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT",
+    "XAU/USD", "EUR/USD", "GBP/USD",
+    "USD/JPY", "USD/CAD", "AUD/USD"
+]
+
