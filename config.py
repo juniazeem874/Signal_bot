@@ -49,8 +49,9 @@ FOREX_PAIRS = [
 AUTO_SCAN_ENABLED = True
 AUTO_SCAN_INTERVAL = 60  # Har 60 seconds (1 minute) baad scan karega
 
-# Railway environment variable se fetch karega
-AUTO_SIGNAL_CHAT_ID = os.getenv("AUTO_SIGNAL_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID_HERE")
+# Railway environment variable se comma-separated Chat IDs read karega
+raw_chat_ids = os.getenv("AUTO_SIGNAL_CHAT_ID", "")
+AUTO_SIGNAL_CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
 
 # Auto-scan kiye jaane wale pairs
 AUTO_SCAN_PAIRS = [
