@@ -138,3 +138,10 @@ def fetch_multi_timeframe(symbol: str, timeframes: list, limit: int = config.CAN
     """Fetch candles for several timeframes of the same symbol.
     Returns {timeframe: dataframe}. Used for top-down multi-timeframe analysis."""
     return {tf: fetch_candles(symbol, tf, limit) for tf in timeframes}
+
+# Function naming mismatch handle karne ke liye wrappers
+if "get_data" in globals():
+    getdata = get_data
+if "getdata" in globals():
+    get_data = getdata
+
