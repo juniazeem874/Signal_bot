@@ -1,6 +1,7 @@
 """
 Indicator and Smart-Money-Concept (SMC) helper calculations.
-Implements VWAP, Fibonacci Golden Pocket, Liquidity Sweeps, Engulfing, and Volume Spikes.
+All functions take/return pandas DataFrames or plain values - no external
+TA library needed, keeps deployment on Railway simple.
 """
 
 import pandas as pd
@@ -15,6 +16,15 @@ def add_emas(df: pd.DataFrame, fast=50, slow=200) -> pd.DataFrame:
     return df
 
 
+def add_adaptive_emas(df: pd.DataFrame) -> pd.DataFrame:
+    """Use EMA50/200 when there's enough history, otherwise fall back to a
+    faster EMA20/50 pair — needed for lower timeframes (1m/5m) where 200
+    candles of real history often isn't available."""
+    if len(df) >= 210:
+        return add_emas(df, fast=50, slow=200)
+    return add_emas(df, fast=20, slow=50)
+
+
 def add_atr(df: pd.DataFrame, period=config.ATR_PERIOD) -> pd.DataFrame:
     df = df.copy()
     high_low = df["high"] - df["low"]
@@ -25,50 +35,30 @@ def add_atr(df: pd.DataFrame, period=config.ATR_PERIOD) -> pd.DataFrame:
     return df
 
 
-def add_vwap(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates Volume Weighted Average Price (VWAP)."""
+def add_volume_avg(df: pd.DataFrame, period=20) -> pd.DataFrame:
     df = df.copy()
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
-    tp_vol = typical_price * df["volume"]
-    cum_tp_vol = tp_vol.cumsum()
-    cum_vol = df["volume"].cumsum().replace(0, 1e-8)
-    df["vwap"] = cum_tp_vol / cum_vol
+    df["vol_avg"] = df["volume"].rolling(period).mean()
     return df
 
 
-def add_volume_sma(df: pd.DataFrame, period=config.VOL_SMA_PERIOD) -> pd.DataFrame:
-    """Calculates simple moving average of volume."""
-    df = df.copy()
-    df["vol_sma"] = df["volume"].rolling(period).mean()
-    return df
-
-
-def get_htf_bias(df_15m: pd.DataFrame) -> str:
-    """
-    Determines HTF (15m) bias based on VWAP & Market Structure:
-    - Bullish: Price > VWAP and EMA50 > EMA200
-    - Bearish: Price < VWAP and EMA50 < EMA200
-    """
-    df_15m = add_vwap(df_15m)
-    df_15m = add_emas(df_15m)
-    last = df_15m.iloc[-1]
-
-    if pd.isna(last["vwap"]):
+def get_trend_bias(df: pd.DataFrame) -> str:
+    """'bullish', 'bearish', or 'neutral' based on EMA50/200 + price position."""
+    last = df.iloc[-1]
+    if pd.isna(last["ema_slow"]):
         return "neutral"
-
-    above_vwap = last["close"] > last["vwap"]
-    below_vwap = last["close"] < last["vwap"]
-    ema_bullish = last["ema_fast"] > last["ema_slow"]
-    ema_bearish = last["ema_fast"] < last["ema_slow"]
-
-    if above_vwap and ema_bullish:
+    if last["ema_fast"] > last["ema_slow"] and last["close"] > last["ema_fast"]:
         return "bullish"
-    elif below_vwap and ema_bearish:
+    if last["ema_fast"] < last["ema_slow"] and last["close"] < last["ema_fast"]:
         return "bearish"
     return "neutral"
 
 
 def find_last_swing(df: pd.DataFrame, lookback=30, window=3):
+    """
+    Find the most recent swing high and swing low within the last `lookback`
+    candles. A swing high/low is a local max/min over `window` candles on
+    each side. Returns (swing_high_price, swing_high_idx, swing_low_price, swing_low_idx).
+    """
     recent = df.tail(lookback).reset_index(drop=True)
     highs, lows = recent["high"], recent["low"]
 
@@ -89,46 +79,46 @@ def find_last_swing(df: pd.DataFrame, lookback=30, window=3):
 def fibonacci_levels(swing_high: float, swing_low: float) -> dict:
     diff = swing_high - swing_low
     return {
-        "0.0": swing_high,
         "0.5": swing_high - diff * 0.5,
         "0.618": swing_high - diff * 0.618,
-        "0.705": swing_high - diff * 0.705,
-        "1.0": swing_low,
+        "0.786": swing_high - diff * 0.786,
     }
 
 
-def is_in_golden_pocket(price: float, swing_high: float, swing_low: float, direction: str) -> bool:
-    """Checks if price is inside the 0.618 - 0.705 Golden Pocket retracement zone."""
-    diff = swing_high - swing_low
-    if diff <= 0:
-        return False
-
-    if direction == "bullish":
-        # Retracement down from swing high
-        gp_top = swing_high - diff * config.FIB_GOLDEN_POCKET_LOW   # 0.618
-        gp_bottom = swing_high - diff * config.FIB_GOLDEN_POCKET_HIGH # 0.705
-        return gp_bottom <= price <= gp_top
-    else:
-        # Retracement up from swing low
-        gp_bottom = swing_low + diff * config.FIB_GOLDEN_POCKET_LOW
-        gp_top = swing_low + diff * config.FIB_GOLDEN_POCKET_HIGH
-        return gp_bottom <= price <= gp_top
+def price_in_fib_zone(price: float, fib: dict, tolerance_pct=0.15) -> bool:
+    """True if price sits within the 0.5-0.786 retracement zone (with a little slack)."""
+    zone_top = fib["0.5"]
+    zone_bottom = fib["0.786"]
+    lo, hi = min(zone_top, zone_bottom), max(zone_top, zone_bottom)
+    slack = (hi - lo) * tolerance_pct
+    return (lo - slack) <= price <= (hi + slack)
 
 
-def detect_bos(df: pd.DataFrame, lookback=20) -> str:
+def detect_bos(df: pd.DataFrame, lookback=30, margin=0.0) -> str:
+    """
+    Break of Structure detector.
+    Returns 'bullish_bos' if price closed above the recent swing high by at
+    least `margin` (in price units), 'bearish_bos' if it closed below the
+    recent swing low by at least `margin`, else 'none'.
+    """
     recent = df.tail(lookback)
     prior = recent.iloc[:-1]
     last_close = recent.iloc[-1]["close"]
 
-    if last_close > prior["high"].max():
+    if last_close > prior["high"].max() + margin:
         return "bullish_bos"
-    if last_close < prior["low"].min():
+    if last_close < prior["low"].min() - margin:
         return "bearish_bos"
     return "none"
 
 
-def detect_fvg(df: pd.DataFrame) -> str:
-    last3 = df.tail(3).reset_index(drop=True)
+def detect_fvg(df: pd.DataFrame, lookback=3) -> str:
+    """
+    Simplified 3-candle Fair Value Gap detector on the most recent candles.
+    Bullish FVG: candle[0].high < candle[2].low
+    Bearish FVG: candle[0].low > candle[2].high
+    """
+    last3 = df.tail(lookback).reset_index(drop=True)
     if len(last3) < 3:
         return "none"
     c0, c2 = last3.iloc[0], last3.iloc[2]
@@ -139,87 +129,15 @@ def detect_fvg(df: pd.DataFrame) -> str:
     return "none"
 
 
-def detect_engulfing(df: pd.DataFrame) -> str:
-    """Detects 1-minute Bullish or Bearish Engulfing Candle."""
-    if len(df) < 2:
-        return "none"
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # Bullish Engulfing
-    if curr["close"] > curr["open"] and prev["close"] < prev["open"]:
-        if curr["close"] >= prev["open"] and curr["open"] <= prev["close"]:
-            return "bullish_engulfing"
-
-    # Bearish Engulfing
-    if curr["close"] < curr["open"] and prev["close"] > prev["open"]:
-        if curr["close"] <= prev["open"] and curr["open"] >= prev["close"]:
-            return "bearish_engulfing"
-
-    return "none"
-
-
-def detect_liquidity_sweep(df: pd.DataFrame, lookback=10) -> str:
-    """Detects liquidity stop hunt/sweep of recent local swings."""
-    if len(df) < lookback + 1:
-        return "none"
-    recent = df.tail(lookback + 1)
-    prev = recent.iloc[:-1]
-    curr = recent.iloc[-1]
-
-    if curr["low"] < prev["low"].min() and curr["close"] > prev["low"].min():
-        return "bullish_sweep"
-    if curr["high"] > prev["high"].max() and curr["close"] < prev["high"].max():
-        return "bearish_sweep"
-    return "none"
-
-
-def volume_spike_confirms(df: pd.DataFrame) -> bool:
-    """True if latest candle volume >= 1.5x of preceding 5-candle SMA."""
-    df = add_volume_sma(df)
+def volume_confirms(df: pd.DataFrame, direction: str) -> bool:
+    """True if the latest candle's volume is above average AND candle color matches direction."""
     last = df.iloc[-1]
-    prev_sma = df.iloc[-2]["vol_sma"] if len(df) > 1 else last["vol_sma"]
-
-    if pd.isna(prev_sma) or prev_sma == 0:
+    if pd.isna(last["vol_avg"]) or last["vol_avg"] == 0:
         return False
-    return last["volume"] >= prev_sma * config.VOL_SPIKE_MULTIPLIER
-    
-    def detect_rejection_candle(df):
-    if len(df) < 1:
-        return "none"
-    curr = df.iloc[-1]
-    candle_range = curr["high"] - curr["low"]
-    if candle_range == 0:
-        return "none"
-
-    body = abs(curr["close"] - curr["open"])
-    upper_wick = curr["high"] - max(curr["open"], curr["close"])
-    lower_wick = min(curr["open"], curr["close"]) - curr["low"]
-
-    if lower_wick / candle_range >= 0.55 and body / candle_range <= 0.35:
-        return "bullish_rejection"
-    if upper_wick / candle_range >= 0.55 and body / candle_range <= 0.35:
-        return "bearish_rejection"
-    return "none"
-
-
-def detect_fake_breakout(df, lookback=15):
-    if len(df) < lookback + 1:
-        return "none"
-    recent = df.tail(lookback + 1)
-    prior = recent.iloc[:-1]
-    curr = recent.iloc[-1]
-
-    prior_high = prior["high"].max()
-    prior_low = prior["low"].min()
-
-    if curr["low"] < prior_low and curr["close"] > prior_low:
-        return "bullish_fakeout"
-
-    if curr["high"] > prior_high and curr["close"] < prior_high:
-        return "bearish_fakeout"
-
-    return "none"
-"
-
-    
+    is_spike = last["volume"] > last["vol_avg"] * 1.2
+    bullish_candle = last["close"] > last["open"]
+    if direction == "bullish":
+        return is_spike and bullish_candle
+    if direction == "bearish":
+        return is_spike and not bullish_candle
+    return False
