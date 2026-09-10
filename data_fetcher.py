@@ -13,15 +13,35 @@ def normalize_symbol(symbol: str) -> str:
     """Normalizes input symbols (e.g., 'XAUUSD' -> 'XAU/USD', 'eurusd' -> 'EUR/USD')."""
     s = symbol.upper().strip()
     
-    # Handle Gold variations
     if s in ["XAUUSD", "GOLD", "XAU-USD"]:
         return "XAU/USD"
     
-    # Handle 6-character Forex pairs without slash (e.g., EURUSD -> EUR/USD)
     if len(s) == 6 and not s.endswith("USDT") and "/" not in s:
         return f"{s[:3]}/{s[3:]}"
         
     return s
+
+
+def get_gold_realtime_goldapi(symbol: str = "XAU/USD"):
+    """Fetches real-time Spot Gold price from GoldAPI.io."""
+    api_key = getattr(config, "GOLDAPI_KEY", "")
+    if not api_key:
+        return None
+
+    try:
+        url = "https://www.goldapi.io/api/XAU/USD"
+        headers = {
+            "x-access-token": api_key,
+            "Content-Type": "application/json"
+        }
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            logger.info(f"GoldAPI.io fetched spot price: {data.get('price')}")
+            return data
+    except Exception as e:
+        logger.error(f"GoldAPI.io fetch error: {e}")
+    return None
 
 
 def get_data_binance(symbol: str, interval: str, limit: int = 500):
@@ -78,10 +98,11 @@ def get_data_twelvedata(symbol: str, interval: str, limit: int = 500):
 
 def get_data_yfinance(symbol: str, interval: str = "1m"):
     """UNLIMITED FALLBACK: Dynamic loader for Gold, Crypto & Forex Currency Pairs."""
+    # Spot Gold ke liye XAUUSD=X mapped hai (Futures GC=F nahi)
     yf_symbol_map = {
-        "XAU/USD": "GC=F",
-        "XAUUSD": "GC=F",
-        "GOLD": "GC=F",
+        "XAU/USD": "XAUUSD=X",
+        "XAUUSD": "XAUUSD=X",
+        "GOLD": "XAUUSD=X",
         "BTCUSDT": "BTC-USD",
         "ETHUSDT": "ETH-USD",
         "SOLUSDT": "SOL-USD",
@@ -128,15 +149,18 @@ def get_data(symbol: str):
     entry_tf_td = getattr(config, "ENTRY_INTERVAL_TWELVEDATA", "1min")
     trend_tf_td = getattr(config, "TREND_INTERVAL_TWELVEDATA", "15min")
 
+    # Crypto check
     if any(crypto in symbol for crypto in ["USDT", "BTC", "ETH", "SOL"]):
         entry_df = get_data_binance(symbol, entry_tf_binance)
         trend_df = get_data_binance(symbol, trend_tf_binance)
         if entry_df is not None and trend_df is not None:
             return entry_df, trend_df
 
+    # Forex & Gold TwelveData check
     entry_df = get_data_twelvedata(symbol, entry_tf_td)
     trend_df = get_data_twelvedata(symbol, trend_tf_td)
 
+    # Fallback to Yahoo Finance (XAUUSD=X Spot Gold)
     if entry_df is None or entry_df.empty or trend_df is None or trend_df.empty:
         logger.info(f"🔄 Fetching {symbol} via Yahoo Finance Fallback...")
         entry_df = get_data_yfinance(symbol, interval="1m")
