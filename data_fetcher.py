@@ -6,145 +6,143 @@ import config
 
 logger = logging.getLogger(__name__)
 
-TWELVEDATA_LIMIT_REACHED = False
+# Interval mapping
+BINANCE_INTERVAL_MAP = {"1min": "1m", "5min": "5m", "15min": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+YFINANCE_INTERVAL_MAP = {"1min": "1m", "5min": "5m", "15min": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
 
+def fetch_binance_crypto(symbol: str, interval="1min", outputsize=100):
+    """Tier 1 (Crypto): Fetch directly from Binance Public API."""
+    clean_symbol = symbol.replace("/", "").replace("-", "").upper()
+    if clean_symbol.endswith("USD") and not clean_symbol.endswith("USDT"):
+        clean_symbol += "T"
+    if not (clean_symbol.endswith("USDT") or clean_symbol.endswith("BUSD")):
+        clean_symbol += "USDT"
 
-def normalize_symbol(symbol: str) -> str:
-    """Normalizes input symbols (e.g., 'XAUUSD' -> 'XAU/USD', 'eurusd' -> 'EUR/USD')."""
-    s = symbol.upper().strip()
-    if s in ["XAUUSD", "GOLD", "XAU-USD"]:
-        return "XAU/USD"
-    if len(s) == 6 and not s.endswith("USDT") and "/" not in s:
-        return f"{s[:3]}/{s[3:]}"
-    return s
+    b_interval = BINANCE_INTERVAL_MAP.get(interval, "1m")
+    url = f"https://api.binance.com/api/v3/klines?symbol={clean_symbol}&interval={b_interval}&limit={outputsize}"
 
-
-def get_data_binance(symbol: str, interval: str, limit: int = 500):
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
         res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            df = pd.DataFrame(data, columns=[
-                'time', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-            ])
-            df['time'] = pd.to_datetime(df['time'], unit='ms')
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
-            return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+        if res.status_code != 200:
+            logger.error(f"❌ Binance API Error ({res.status_code}) for {clean_symbol}")
+            return None
+
+        data = res.json()
+        if not isinstance(data, list) or len(data) == 0:
+            return None
+
+        df = pd.DataFrame(data, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume", "ignore"
+        ])
+        df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+
+        return df[['datetime', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
-        logger.error(f"Binance fetch error for {symbol}: {e}")
-    return None
-
-
-def get_data_twelvedata(symbol: str, interval: str, limit: int = 500):
-    """Fetches exact Spot Price (Exness matching) from TwelveData."""
-    global TWELVEDATA_LIMIT_REACHED
-
-    if TWELVEDATA_LIMIT_REACHED:
+        logger.error(f"❌ Binance Exception for {symbol}: {e}")
         return None
 
+
+def fetch_twelvedata_forex(symbol: str, interval="1min", outputsize=100):
+    """Tier 1 (Forex/Gold): Primary fetch via TwelveData."""
     api_key = getattr(config, "TWELVEDATA_API_KEY", "")
     if not api_key:
         return None
 
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={limit}&apikey={api_key}"
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={api_key}"
+
     try:
         res = requests.get(url, timeout=10)
-        json_data = res.json()
+        data = res.json()
 
-        if res.status_code == 200 and "values" in json_data:
-            df = pd.DataFrame(json_data["values"])
-            df["time"] = pd.to_datetime(df["datetime"])
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].astype(float) if col in df.columns else 0.0
-            df = df.sort_values("time").reset_index(drop=True)
-            return df[["time", "open", "high", "low", "close", "volume"]]
+        if "values" not in data:
+            logger.warning(f"⚠️ TwelveData limit/error for {symbol}: {data.get('message', 'No data')}")
+            return None
 
-        if json_data.get("code") == 429 or "api key" in str(json_data.get("message")).lower():
-            logger.warning("⚠️ TwelveData limit reached! Switching to Yahoo Finance Spot Fallback.")
-            TWELVEDATA_LIMIT_REACHED = True
+        df = pd.DataFrame(data["values"])
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.sort_values('datetime').reset_index(drop=True)
 
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+
+        return df[['datetime', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
-        logger.error(f"TwelveData error for {symbol}: {e}")
-
-    return None
-
-
-def fetch_yf_dataframe(yf_symbol: str, interval: str):
-    """Fetches and cleans yfinance dataframe strictly for Spot symbols."""
-    try:
-        yf_interval = "1m" if interval in ["1m", "1min"] else "15m"
-        period = "1d" if yf_interval == "1m" else "5d"
-
-        df = yf.download(yf_symbol, period=period, interval=yf_interval, progress=False)
-        if df is not None and not df.empty:
-            df = df.reset_index()
-            
-            # Clean MultiIndex columns
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [col[0] for col in df.columns]
-
-            time_col = "Datetime" if "Datetime" in df.columns else "Date"
-            if time_col in df.columns:
-                df = df.rename(columns={
-                    time_col: "time",
-                    "Open": "open",
-                    "High": "high",
-                    "Low": "low",
-                    "Close": "close",
-                    "Volume": "volume"
-                })
-                df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
-                return df[["time", "open", "high", "low", "close", "volume"]]
-    except Exception as e:
-        logger.error(f"yfinance download error for {yf_symbol}: {e}")
-    return None
+        logger.error(f"❌ TwelveData Exception for {symbol}: {e}")
+        return None
 
 
-def get_data_yfinance(symbol: str, interval: str = "1m"):
-    """Strict Spot Price Fallback to match Exness Live Rates."""
-    if symbol == "XAU/USD":
-        # Strictly use Spot Gold Tickers (Avoid GC=F Futures)
+def fetch_yfinance_forex(symbol: str, interval="1min", outputsize=100):
+    """Tier 2 (Forex/Gold Fallback): Pure Spot Data via Yahoo Finance."""
+    yf_interval = YFINANCE_INTERVAL_MAP.get(interval, "1m")
+    period = "1d" if yf_interval in ["1m", "5m"] else "5d"
+
+    # Strict Spot mapping for Gold and Forex (Avoids COMEX Futures GC=F)
+    if symbol.upper() in ["XAU/USD", "XAUUSD", "GOLD"]:
         tickers_to_try = ["XAUUSD=X", "XAU-USD"]
     elif "/" in symbol:
         tickers_to_try = [symbol.replace("/", "") + "=X"]
     else:
-        tickers_to_try = [symbol]
+        tickers_to_try = [symbol + "=X" if not symbol.endswith("=X") else symbol]
 
     for ticker in tickers_to_try:
-        df = fetch_yf_dataframe(ticker, interval)
-        if df is not None and not df.empty:
-            return df
+        try:
+            df = yf.download(ticker, period=period, interval=yf_interval, progress=False)
+            if df is not None and not df.empty:
+                df = df.reset_index()
+
+                # Clean MultiIndex headers
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [col[0] for col in df.columns]
+
+                time_col = "Datetime" if "Datetime" in df.columns else "Date"
+                if time_col in df.columns:
+                    df = df.rename(columns={
+                        time_col: "datetime",
+                        "Open": "open",
+                        "High": "high",
+                        "Low": "low",
+                        "Close": "close",
+                        "Volume": "volume"
+                    })
+                    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+                    df = df.tail(outputsize).reset_index(drop=True)
+
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        if col in df.columns:
+                            df[col] = df[col].astype(float)
+
+                    logger.info(f"🔄 Yahoo Finance Fallback SUCCESS for {symbol} ({ticker})")
+                    return df[['datetime', 'open', 'high', 'low', 'close', 'volume']]
+        except Exception as e:
+            logger.error(f"❌ Yahoo Finance error for {ticker}: {e}")
 
     return None
 
 
-def get_data(symbol: str):
-    """Main router for accurate Spot prices."""
-    symbol = normalize_symbol(symbol)
-    
-    entry_tf_binance = getattr(config, "ENTRY_INTERVAL_BINANCE", "1m")
-    trend_tf_binance = getattr(config, "TREND_INTERVAL_BINANCE", "15m")
-    entry_tf_td = getattr(config, "ENTRY_INTERVAL_TWELVEDATA", "1min")
-    trend_tf_td = getattr(config, "TREND_INTERVAL_TWELVEDATA", "15min")
+def get_data(symbol: str, interval="1min", outputsize=100):
+    """
+    Smart 3-Tier Data Router:
+    1. Crypto -> Binance Public API (Instant, No Key)
+    2. Forex/Gold -> TwelveData (Primary)
+    3. Forex/Gold -> Yahoo Finance Spot Fallback (Free & Unlimited)
+    """
+    crypto_keywords = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "USDT"]
+    is_crypto = any(coin in symbol.upper() for coin in crypto_keywords)
 
-    # Crypto check
-    if any(crypto in symbol for crypto in ["USDT", "BTC", "ETH", "SOL"]):
-        entry_df = get_data_binance(symbol, entry_tf_binance)
-        trend_df = get_data_binance(symbol, trend_tf_binance)
-        if entry_df is not None and trend_df is not None:
-            return entry_df, trend_df
+    if is_crypto:
+        return fetch_binance_crypto(symbol, interval, outputsize)
 
-    # Forex & Gold Tier 1: TwelveData (Best for Spot Price)
-    entry_df = get_data_twelvedata(symbol, entry_tf_td)
-    trend_df = get_data_twelvedata(symbol, trend_tf_td)
+    # 1st Priority: TwelveData
+    df = fetch_twelvedata_forex(symbol, interval, outputsize)
 
-    # Forex & Gold Tier 2: Pure Spot Fallback
-    if entry_df is None or entry_df.empty or trend_df is None or trend_df.empty:
-        logger.info(f"🔄 Fetching {symbol} via Pure Spot Yahoo Fallback...")
-        entry_df = get_data_yfinance(symbol, interval="1m")
-        trend_df = get_data_yfinance(symbol, interval="15m")
+    # 2nd Priority Fallback: Yahoo Finance Spot
+    if df is None or df.empty:
+        logger.info(f"🔁 TwelveData inactive or limited. Switching {symbol} to Yahoo Finance Fallback...")
+        df = fetch_yfinance_forex(symbol, interval, outputsize)
 
-    return entry_df, trend_df
+    return df
