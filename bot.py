@@ -1,12 +1,11 @@
 import logging
-import time
-import threading
-import telebot
-from telebot import types
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 import config
 import data_fetcher
-import strategy  # Strategy file jisme market analysis logic ho
+import strategy
 
 # Logging Configuration
 logging.basicConfig(
@@ -15,193 +14,162 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Bot
 BOT_TOKEN = getattr(config, "TELEGRAM_BOT_TOKEN", "")
 if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN missing in config.py!")
+    raise ValueError("TELEGRAM_BOT_TOKEN missing in config.py / environment!")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+DEFAULT_PAIRS = getattr(config, "AUTO_SCAN_PAIRS", ["BTCUSDT", "XAU/USD", "EUR/USD", "GBP/USD", "USD/JPY"])
+SCAN_INTERVAL = getattr(config, "AUTO_SCAN_INTERVAL", 60)
 
-# Global Bot State
-AUTO_TRADE_ENABLED = False
-ACTIVE_CHAT_IDS = set()
-LAST_SIGNALS = {}  # Duplicate signals se bachne ke liye {symbol: "BUY_time"}
-
-# Default Pairs list (agar config mein Na ho)
-DEFAULT_PAIRS = getattr(config, "PAIRS", ["BTCUSDT", "XAU/USD", "EUR/USD", "GBP/USD", "USD/JPY"])
+# Duplicate-signal guard: {symbol: "SIGNAL_time"}
+LAST_SIGNALS = {}
 
 
-def send_signal_to_all(message_text: str):
-    """Active chats ko signal notify karta hai."""
-    for chat_id in list(ACTIVE_CHAT_IDS):
+def _format_signal_message(symbol: str, result: dict, header: str) -> str:
+    signal = result.get("signal", "HOLD")
+    icon = "🟢" if signal == "BUY" else "🔴"
+    reasons = result.get("reasons") or []
+    reasons_str = "\n".join(f"• {r}" for r in reasons) if reasons else "Strategy conditions met"
+    return (
+        f"{icon} **{header}** {icon}\n\n"
+        f"**Pair:** `{symbol}`\n"
+        f"**Action:** `{signal}`\n"
+        f"**Entry Price:** `{result.get('price', 'N/A')}`\n"
+        f"**Take Profit (TP):** `{result.get('take_profit', 'N/A')}`\n"
+        f"**Stop Loss (SL):** `{result.get('stop_loss', 'N/A')}`\n"
+        f"**Confidence:** `{result.get('confidence', 'N/A')}%`\n"
+        f"**Reasons:**\n{reasons_str}"
+    )
+
+
+async def _send_to_all(context: ContextTypes.DEFAULT_TYPE, chat_ids, message_text: str):
+    for chat_id in list(chat_ids):
         try:
-            bot.send_message(chat_id, message_text, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=message_text, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
 
 
-def auto_scan_job():
-    """Background Auto-Scan Loop jo continuously markets scan karta hai."""
-    global AUTO_TRADE_ENABLED
+async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every SCAN_INTERVAL seconds via the JobQueue and scans all pairs."""
+    bot_data = context.application.bot_data
+    if not bot_data.get("auto_trade_enabled") or not bot_data.get("active_chat_ids"):
+        return
 
-    logger.info("⚡ Background Auto-Scanner Thread Started...")
+    logger.info("Scanning markets for entry setups...")
 
-    while True:
+    for symbol in DEFAULT_PAIRS:
         try:
-            if AUTO_TRADE_ENABLED and ACTIVE_CHAT_IDS:
-                logger.info("🔍 Scanning markets for entry setups...")
+            entry_df, trend_df = data_fetcher.get_data(symbol)
+            if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
+                logger.warning(f"Market data missing/empty for {symbol}")
+                continue
 
-                for symbol in DEFAULT_PAIRS:
-                    try:
-                        # Fetch Data safely
-                        res = data_fetcher.get_data(symbol)
+            result = await strategy.analyze(entry_df, trend_df, symbol)
+            signal = result.get("signal", "HOLD")
+            if signal == "HOLD":
+                continue
 
-                        # Unpack Safety Check
-                        if not isinstance(res, tuple) or len(res) != 2:
-                            logger.warning(f"⚠️ Invalid data format for {symbol}")
-                            continue
+            current_time_str = str(entry_df['time'].iloc[-1])
+            signal_key = f"{symbol}_{signal}_{current_time_str}"
+            if LAST_SIGNALS.get(symbol) == signal_key:
+                continue
+            LAST_SIGNALS[symbol] = signal_key
 
-                        entry_df, trend_df = res
+            msg = _format_signal_message(symbol, result, "AUTOMATED TRADE SIGNAL")
+            await _send_to_all(context, bot_data["active_chat_ids"], msg)
 
-                        if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
-                            logger.warning(f"⚠️ Market data missing/empty for {symbol}")
-                            continue
-
-                        # Generate Signal from Strategy
-                        # Expected signal format: {"action": "BUY"/"SELL"/"HOLD", "price": 0.0, "tp": 0.0, "sl": 0.0, "reason": "..."}
-                        signal = strategy.analyze_market(symbol, entry_df, trend_df)
-
-                        if not signal or signal.get("action") == "HOLD":
-                            continue
-
-                        action = signal.get("action")
-                        current_time_str = str(entry_df['time'].iloc[-1])
-                        signal_key = f"{symbol}_{action}_{current_time_str}"
-
-                        # Prevent sending duplicate signals for the same candle
-                        if LAST_SIGNALS.get(symbol) == signal_key:
-                            continue
-
-                        LAST_SIGNALS[symbol] = signal_key
-
-                        # Format Signal Notification
-                        icon = "🟢" if action == "BUY" else "🔴"
-                        msg = (
-                            f"{icon} **AUTOMATED TRADE SIGNAL** {icon}\n\n"
-                            f"**Pair:** `{symbol}`\n"
-                            f"**Action:** `{action}`\n"
-                            f"**Entry Price:** `{signal.get('price', 'N/A')}`\n"
-                            f"**Take Profit (TP):** `{signal.get('tp', 'N/A')}`\n"
-                            f"**Stop Loss (SL):** `{signal.get('sl', 'N/A')}`\n"
-                            f"**Reason:** {signal.get('reason', 'Strategy Conditions Met')}\n\n"
-                            f"⏱️ _Time: {current_time_str}_"
-                        )
-
-                        send_signal_to_all(msg)
-
-                    except Exception as pair_err:
-                        logger.error(f"⚠️ Couldn't get signal for {symbol}: {pair_err}")
-
-            # Sleep interval between market scans (60 seconds)
-            time.sleep(60)
-
-        except Exception as loop_err:
-            logger.error(f"Error in auto_scan_loop: {loop_err}")
-            time.sleep(10)
+        except Exception as pair_err:
+            logger.error(f"Couldn't get signal for {symbol}: {pair_err}")
 
 
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    ACTIVE_CHAT_IDS.add(message.chat.id)
+async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_data = context.application.bot_data
+    bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
+    # Auto-trade turns on as soon as someone starts the bot.
+    bot_data["auto_trade_enabled"] = True
+
     welcome_msg = (
         "🤖 **Trading Signal Bot Active**\n\n"
+        f"Auto-scanning every `{SCAN_INTERVAL}s` — you'll get signals automatically.\n\n"
         "Commands:\n"
         "• `/autoon` - Automatic trading signals ON karein\n"
         "• `/autooff` - Automatic trading signals OFF karein\n"
         "• `/signal [PAIR]` - Instant manual signal check karein (e.g. `/signal BTCUSDT`)\n"
         "• `/status` - Bot status dekhein"
     )
-    bot.reply_to(message, welcome_msg, parse_mode="Markdown")
+    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
 
 
-@bot.message_handler(commands=['autoon'])
-def enable_autotrade(message):
-    global AUTO_TRADE_ENABLED
-    AUTO_TRADE_ENABLED = True
-    ACTIVE_CHAT_IDS.add(message.chat.id)
-    bot.reply_to(
-        message,
-        "✅ **Auto-Trade Mode Activated!**\nBot ab background mein market scan karke alerts bheje ga."
+async def enable_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_data = context.application.bot_data
+    bot_data["auto_trade_enabled"] = True
+    bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
+    await update.message.reply_text(
+        "✅ **Auto-Trade Mode Activated!**\nBot ab background mein market scan karke alerts bheje ga.",
+        parse_mode="Markdown"
     )
 
 
-@bot.message_handler(commands=['autooff'])
-def disable_autotrade(message):
-    global AUTO_TRADE_ENABLED
-    AUTO_TRADE_ENABLED = False
-    bot.reply_to(message, "🛑 **Auto-Trade Mode Deactivated.**")
+async def disable_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["auto_trade_enabled"] = False
+    await update.message.reply_text("🛑 **Auto-Trade Mode Deactivated.**", parse_mode="Markdown")
 
 
-@bot.message_handler(commands=['status'])
-def check_status(message):
-    status_str = "🟢 Active" if AUTO_TRADE_ENABLED else "🔴 Disabled"
-    bot.reply_to(
-        message,
-        f"📊 **Bot Status:**\nAuto-Trade: `{status_str}`\nTracked Pairs: `{len(DEFAULT_PAIRS)}`"
+async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_data = context.application.bot_data
+    enabled = bot_data.get("auto_trade_enabled", False)
+    status_str = "🟢 Active" if enabled else "🔴 Disabled"
+    await update.message.reply_text(
+        f"📊 **Bot Status:**\nAuto-Trade: `{status_str}`\n"
+        f"Scan Interval: `{SCAN_INTERVAL}s`\nTracked Pairs: `{len(DEFAULT_PAIRS)}`",
+        parse_mode="Markdown"
     )
 
 
-@bot.message_handler(commands=['signal'])
-def manual_signal(message):
+async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Single pair ka instant signal check karta hai."""
-    args = message.text.split()
-    symbol = args[1].upper() if len(args) > 1 else "BTCUSDT"
+    symbol = context.args[0].upper() if context.args else "BTCUSDT"
 
-    bot.reply_to(message, f"🔍 Fetching analysis for `{symbol}`...")
+    await update.message.reply_text(f"🔍 Fetching analysis for `{symbol}`...", parse_mode="Markdown")
 
     try:
-        res = data_fetcher.get_data(symbol)
-        if not isinstance(res, tuple) or len(res) != 2:
-            bot.reply_to(message, f"❌ Could not fetch valid data for `{symbol}`")
-            return
-
-        entry_df, trend_df = res
+        entry_df, trend_df = data_fetcher.get_data(symbol)
         if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
-            bot.reply_to(message, f"❌ Market data empty for `{symbol}`")
+            await update.message.reply_text(f"❌ Market data empty for `{symbol}`", parse_mode="Markdown")
             return
 
-        signal = strategy.analyze_market(symbol, entry_df, trend_df)
-        action = signal.get("action", "HOLD")
+        result = await strategy.analyze(entry_df, trend_df, symbol)
+        signal = result.get("signal", "HOLD")
 
-        if action == "HOLD":
-            bot.reply_to(message, f"⏸️ **{symbol}:** No trade setup right now (HOLD).")
+        if signal == "HOLD":
+            await update.message.reply_text(f"⏸️ **{symbol}:** No trade setup right now (HOLD).", parse_mode="Markdown")
         else:
-            icon = "🟢" if action == "BUY" else "🔴"
-            msg = (
-                f"{icon} **MANUAL SIGNAL RESULT**\n\n"
-                f"**Pair:** `{symbol}`\n"
-                f"**Action:** `{action}`\n"
-                f"**Entry Price:** `{signal.get('price', 'N/A')}`\n"
-                f"**Take Profit (TP):** `{signal.get('tp', 'N/A')}`\n"
-                f"**Stop Loss (SL):** `{signal.get('sl', 'N/A')}`"
-            )
-            bot.reply_to(message, msg, parse_mode="Markdown")
+            msg = _format_signal_message(symbol, result, "MANUAL SIGNAL RESULT")
+            await update.message.reply_text(msg, parse_mode="Markdown")
 
     except Exception as e:
-        bot.reply_to(message, f"⚠️ Error: {e}")
+        logger.error(f"Manual signal error for {symbol}: {e}")
+        await update.message.reply_text(f"⚠️ Error: {e}")
 
 
-# ==================== MAIN EXECUTION ====================
+# ==================== APP BUILDER ====================
 
-if __name__ == "__main__":
-    logger.info("🚀 Starting Trading Bot...")
+def build_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # Start Auto-Scanner in a background daemon thread
-    scanner_thread = threading.Thread(target=auto_scan_job, daemon=True)
-    scanner_thread.start()
+    app.bot_data["active_chat_ids"] = set()
+    app.bot_data["auto_trade_enabled"] = getattr(config, "AUTO_SCAN_ENABLED", False)
 
-    # Start Telegram Bot Polling
-    logger.info("🤖 Bot is polling for Telegram commands...")
-    bot.infinity_polling()
+    app.add_handler(CommandHandler(["start", "help"], send_welcome))
+    app.add_handler(CommandHandler("autoon", enable_autotrade))
+    app.add_handler(CommandHandler("autooff", disable_autotrade))
+    app.add_handler(CommandHandler("status", check_status))
+    app.add_handler(CommandHandler("signal", manual_signal))
+
+    # Runs auto_scan_job every SCAN_INTERVAL seconds in the background.
+    app.job_queue.run_repeating(auto_scan_job, interval=SCAN_INTERVAL, first=10)
+
+    return app
