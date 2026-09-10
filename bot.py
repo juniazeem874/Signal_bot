@@ -19,8 +19,19 @@ logger = logging.getLogger(__name__)
 # Cache to avoid duplicate notifications on the same candle
 last_sent_signals = {}
 
-# Runtime Global State for Auto Signal (Default comes from config)
-AUTO_SCAN_ACTIVE = getattr(config, "AUTO_SCAN_ENABLED", True)
+# Convert initial config Chat IDs to a Set of active Chat IDs (Per-User tracking)
+def get_initial_active_chats():
+    raw_ids = getattr(config, "AUTO_SIGNAL_CHAT_IDS", [])
+    active_set = set()
+    for cid in raw_ids:
+        try:
+            active_set.add(int(cid))
+        except (ValueError, TypeError):
+            pass
+    return active_set
+
+# Dynamic set of Chat IDs that currently have Auto Signal turned ON
+ACTIVE_AUTO_SCAN_CHATS = get_initial_active_chats()
 
 
 async def post_init(application) -> None:
@@ -44,10 +55,10 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def autoon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to enable Auto Signals"""
-    global AUTO_SCAN_ACTIVE
-    AUTO_SCAN_ACTIVE = True
-    msg = "🟢 **Auto Signals TURNED ON!**\n\nBackground scanner is now actively monitoring pairs for BUY/SELL setups."
+    """Command to enable Auto Signals for THIS specific chat only"""
+    chat_id = update.effective_chat.id
+    ACTIVE_AUTO_SCAN_CHATS.add(chat_id)
+    msg = "🟢 **Auto Signals TURNED ON for this chat!**\n\nYou will now receive automated signals."
     if update.message:
         await update.message.reply_text(msg, parse_mode="Markdown")
     elif update.callback_query:
@@ -55,10 +66,10 @@ async def autoon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def autooff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to disable Auto Signals"""
-    global AUTO_SCAN_ACTIVE
-    AUTO_SCAN_ACTIVE = False
-    msg = "🔴 **Auto Signals TURNED OFF!**\n\nAutomated background alerts are paused. Manual `/signal` and buttons will still work normally."
+    """Command to disable Auto Signals for THIS specific chat only"""
+    chat_id = update.effective_chat.id
+    ACTIVE_AUTO_SCAN_CHATS.discard(chat_id)
+    msg = "🔴 **Auto Signals TURNED OFF for this chat!**\n\nAutomated background alerts are paused for you. Manual `/signal` and buttons will still work normally."
     if update.message:
         await update.message.reply_text(msg, parse_mode="Markdown")
     elif update.callback_query:
@@ -66,10 +77,13 @@ async def autooff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_str = "🟢 ON" if AUTO_SCAN_ACTIVE else "🔴 OFF"
+    chat_id = update.effective_chat.id
+    is_active = chat_id in ACTIVE_AUTO_SCAN_CHATS
+    
+    status_str = "🟢 ON" if is_active else "🔴 OFF"
     toggle_button = (
         InlineKeyboardButton("🔴 Turn OFF Auto Signal", callback_data="toggle_auto_off")
-        if AUTO_SCAN_ACTIVE
+        if is_active
         else InlineKeyboardButton("🟢 Turn ON Auto Signal", callback_data="toggle_auto_on")
     )
 
@@ -95,7 +109,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"⚡ **Institutional AI Scalping Bot**\n\n"
-        f"🤖 **Auto-Signal Status:** `{status_str}`\n\n"
+        f"🤖 **Your Auto-Signal Status:** `{status_str}`\n\n"
         f"• Toggle Auto Signal: Use buttons above or `/autoon` / `/autooff`\n"
         f"• Manual Check: Click pair buttons or type `/signal BTCUSDT`\n"
         f"• Get Chat ID: `/myid`"
@@ -123,7 +137,6 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
                 await status_msg.edit_text(err_text, parse_mode="Markdown")
             return
 
-        # FIXED: Added await here
         analysis = await strategy.analyze(entry_df, trend_df, symbol)
         signal_type = analysis.get("signal", "HOLD")
         price = analysis.get("price", 0.0)
@@ -167,27 +180,21 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background task: Only runs if AUTO_SCAN_ACTIVE is True."""
-    global AUTO_SCAN_ACTIVE
-    if not AUTO_SCAN_ACTIVE:
-        return
-
-    chat_ids = getattr(config, "AUTO_SIGNAL_CHAT_IDS", [])
-    if not chat_ids:
+    """Background task: Only sends alerts to Chat IDs that have Auto-Scan ACTIVE."""
+    if not ACTIVE_AUTO_SCAN_CHATS:
         return
 
     pairs = getattr(config, "AUTO_SCAN_PAIRS", ["BTCUSDT", "XAU/USD", "EUR/USD"])
 
     for symbol in pairs:
         try:
-            if not AUTO_SCAN_ACTIVE:
+            if not ACTIVE_AUTO_SCAN_CHATS:
                 break
 
             entry_df, trend_df = df_fetcher.get_data(symbol)
             if entry_df is None or entry_df.empty or trend_df is None or trend_df.empty:
                 continue
 
-            # FIXED: Added await here
             analysis = await strategy.analyze(entry_df, trend_df, symbol)
             signal_type = analysis.get("signal", "HOLD")
 
@@ -212,7 +219,8 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
                         f"📋 **Analysis:**\n{reasons_text}"
                     )
 
-                    for cid in chat_ids:
+                    # Send ONLY to users who have Auto Signal ON
+                    for cid in list(ACTIVE_AUTO_SCAN_CHATS):
                         try:
                             await context.bot.send_message(chat_id=cid, text=alert_msg, parse_mode="Markdown")
                         except Exception as send_err:
@@ -234,13 +242,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    chat_id = update.effective_chat.id
 
     if data == "toggle_auto_on":
-        global AUTO_SCAN_ACTIVE
-        AUTO_SCAN_ACTIVE = True
+        ACTIVE_AUTO_SCAN_CHATS.add(chat_id)
         await start_command(update, context)
     elif data == "toggle_auto_off":
-        AUTO_SCAN_ACTIVE = False
+        ACTIVE_AUTO_SCAN_CHATS.discard(chat_id)
         await start_command(update, context)
     elif data.startswith("sig_"):
         symbol = data.replace("sig_", "")
