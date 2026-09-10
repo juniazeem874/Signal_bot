@@ -15,21 +15,20 @@ CANDLE_LIMIT = 500
 
 # ---- ACCURACY & RISK ACCORDING TO SCALPING ----
 MIN_RISK_REWARD = 1.8         # Realistic TP target for 1m scalping
-ATR_SL_MULTIPLIER = 1.5       # ATR buffer to stop premature SL hits
 MIN_AI_CONFIDENCE = 85        # Minimum 85% AI confidence required for BUY/SELL
 ATR_PERIOD = 14
 
-# ---- MAX ALLOWED SPREAD (In Pips) ----
-MAX_ALLOWED_SPREAD = {
-    "EUR/USD": 1.5,
-    "GBP/USD": 2.0,
-    "USD/JPY": 2.0,
-    "USD/CAD": 2.0,
-    "AUD/USD": 2.0,
-    "XAU/USD": 3.5,
-    "BTCUSDT": 5.0,
-    "ETHUSDT": 3.0,
-    "SOLUSDT": 3.0
+# ---- EXNESS SPREAD BUFFER PADDING (To avoid early SL hits on Exness) ----
+EXNESS_SPREAD_BUFFERS = {
+    "XAU/USD": 0.35,   # $0.35 Gold Spread Buffer
+    "EUR/USD": 0.00015, # 1.5 Pips
+    "GBP/USD": 0.00020, # 2.0 Pips
+    "USD/JPY": 0.020,   # 2.0 Pips
+    "USD/CAD": 0.00020,
+    "AUD/USD": 0.00020,
+    "BTCUSDT": 10.0,    # $10 Buffer
+    "ETHUSDT": 1.5,
+    "SOLUSDT": 0.10
 }
 
 PIP_SIZE = {
@@ -52,7 +51,7 @@ FOREX_PAIRS = [
 
 # ---- Auto Scan Settings ----
 AUTO_SCAN_ENABLED = True
-AUTO_SCAN_INTERVAL = 60
+AUTO_SCAN_INTERVAL = 30  # Scan every 30 seconds for live active trade tracking
 
 raw_chat_ids = os.getenv("AUTO_SIGNAL_CHAT_ID", "")
 AUTO_SIGNAL_CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
