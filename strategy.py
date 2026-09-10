@@ -19,11 +19,9 @@ async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
     last_price = entry_df.iloc[-1]["close"]
     latest_atr = entry_df.iloc[-1]["atr"] if "atr" in entry_df.columns else (last_price * 0.001)
 
-    in_gp_bull = ind.is_in_golden_pocket(last_price, swing_high, swing_low, "bullish")
-    in_gp_bear = ind.is_in_golden_pocket(last_price, swing_high, swing_low, "bearish")
-    has_volume_confirm = ind.has_above_avg_volume(entry_df, period=20)
-
-    # Fetch Fundamental / News Data
+    pip_size = config.PIP_SIZE.get(symbol, 0.0001)
+    
+    # News Context
     news_data = news_fetcher.get_economic_news(symbol)
 
     patterns = []
@@ -37,37 +35,38 @@ async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
         "last_price": last_price,
         "htf_bias": htf_bias,
         "patterns": patterns if patterns else ["None"],
-        "volume_status": "High Volume Spike (> 20 SMA)" if has_volume_confirm else "Normal Volume",
+        "volume_status": "High Volume Spike (> 20 SMA)" if ind.has_above_avg_volume(entry_df, period=20) else "Normal",
         "swing_high": swing_high,
         "swing_low": swing_low,
         "atr": latest_atr,
-        "golden_pocket": "Bullish GP" if in_gp_bull else ("Bearish GP" if in_gp_bear else "None"),
         "news_data": news_data
     }
 
-    # ---- AI Combined Fundamental + Technical Analysis ----
+    # Pass data directly to AI for final confluence check
     ai_result = await ai_analyzer.analyze_market_with_ai(symbol, market_summary)
 
     if ai_result and "signal" in ai_result:
         signal = ai_result.get("signal", "HOLD").upper()
+        raw_sl = ai_result.get("stop_loss")
+        raw_tp = ai_result.get("take_profit")
+
         return {
             "price": last_price,
             "trend_bias": htf_bias,
             "signal": signal,
             "confidence": ai_result.get("confidence", 85),
-            "reasons": ai_result.get("reasons", ["Multi-factor analysis complete."]),
-            "stop_loss": ai_result.get("stop_loss"),
-            "take_profit": ai_result.get("take_profit"),
+            "reasons": ai_result.get("reasons", []),
+            "stop_loss": raw_sl,
+            "take_profit": raw_tp,
             "rr_ratio": getattr(config, "MIN_RISK_REWARD", 1.8),
         }
 
-    # Fallback to HOLD if analysis incomplete
     return {
         "price": last_price,
         "trend_bias": htf_bias,
         "signal": "HOLD",
         "confidence": 0,
-        "reasons": ["Awaiting strong technical + fundamental news confirmation."],
+        "reasons": ["Awaiting strong technical + fundamental confluence."],
         "stop_loss": None,
         "take_profit": None,
         "rr_ratio": None,
