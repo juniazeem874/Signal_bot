@@ -1,40 +1,83 @@
 import requests
 import logging
+from datetime import datetime, timedelta
+
+import config
 
 logger = logging.getLogger(__name__)
 
+_CURRENCY_MAP = {"EUR": "EUR", "GBP": "GBP", "JPY": "JPY", "AUD": "AUD", "CAD": "CAD", "CHF": "CHF"}
+
+
+def _base_currency(symbol: str) -> str:
+    for code in _CURRENCY_MAP:
+        if code in symbol.upper():
+            return code
+    return "USD"
+
+
 def get_economic_news(symbol: str) -> dict:
     """
-    Fetches economic calendar context & high impact news.
-    Extracts relevant currency (e.g. USD for XAU/USD & BTC, EUR for EUR/USD).
+    Fetches today's high-impact economic calendar events relevant to `symbol`'s
+    base currency, using Finnhub's free economic calendar endpoint.
+    Requires FINNHUB_API_KEY in config/env — without it, returns a neutral
+    status instead of failing (get a free key at finnhub.io).
     """
-    try:
-        # Determine base currency for news filtering
-        currency = "USD"
-        if "EUR" in symbol:
-            currency = "EUR"
-        elif "GBP" in symbol:
-            currency = "GBP"
-        elif "JPY" in symbol:
-            currency = "JPY"
+    currency = _base_currency(symbol)
+    api_key = getattr(config, "FINNHUB_API_KEY", "")
 
-        # Fetching free economic calendar data feed
-        url = "https://npoint.io/docs/ecocal"  # Replace or use free Finnhub/ForexFactory endpoint if available
-        # Fallback structured mock/live aggregator format for AI parsing
-        response = requests.get("https://api.gameofstocks.co/news", timeout=5)
-        
-        if response.status_code == 200:
-            news_data = response.json()
+    if not api_key:
+        return {
+            "currency": currency,
+            "news_status": "No news feed configured (set FINNHUB_API_KEY)",
+            "upcoming_events": "Unknown — AI should rely on price action only"
+        }
+
+    try:
+        today = datetime.utcnow().date()
+        params = {
+            "from": today.isoformat(),
+            "to": (today + timedelta(days=1)).isoformat(),
+            "token": api_key,
+        }
+        res = requests.get("https://finnhub.io/api/v1/calendar/economic", params=params, timeout=8)
+
+        if res.status_code != 200:
+            logger.warning(f"Finnhub calendar HTTP {res.status_code}")
             return {
                 "currency": currency,
-                "news_status": "Active Data Fetched",
-                "upcoming_events": news_data[:3] if isinstance(news_data, list) else "No Immediate High Impact News"
+                "news_status": "News feed unavailable (API error)",
+                "upcoming_events": "Unknown"
             }
+
+        data = res.json().get("economicCalendar", [])
+        relevant = [
+            ev for ev in data
+            if ev.get("country") in (currency, "US" if currency == "USD" else currency)
+            and ev.get("impact") in ("high", "medium")
+        ]
+
+        if not relevant:
+            return {
+                "currency": currency,
+                "news_status": "Normal Market Hours (No High-Impact Events Today)",
+                "upcoming_events": "None"
+            }
+
+        events_summary = [
+            f"{ev.get('event')} ({ev.get('impact')} impact) at {ev.get('time')}"
+            for ev in relevant[:3]
+        ]
+        return {
+            "currency": currency,
+            "news_status": "High/Medium Impact Events Today",
+            "upcoming_events": events_summary
+        }
+
     except Exception as e:
         logger.warning(f"Could not fetch live news feed: {e}")
-
-    return {
-        "currency": "USD/Global",
-        "news_status": "Normal Market Hours (No High-Impact Deviation)",
-        "upcoming_events": "None in the next 30 minutes"
-    }
+        return {
+            "currency": currency,
+            "news_status": "News feed unavailable (exception)",
+            "upcoming_events": "Unknown"
+        }
