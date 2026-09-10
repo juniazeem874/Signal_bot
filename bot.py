@@ -8,6 +8,7 @@ from telegram.ext import (
 )
 import data_fetcher as df_fetcher
 import strategy
+import ai_analyzer
 import config
 
 logging.basicConfig(
@@ -16,10 +17,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Cache to avoid duplicate notifications on the same candle
-last_sent_signals = {}
+# Active Trade Memory Tracker: { "XAU/USD": { "signal": "BUY", "price": 2700, "stop_loss": 2690, ... } }
+ACTIVE_OPEN_TRADES = {}
 
-# Convert initial config Chat IDs to a Set of active Chat IDs (Per-User tracking)
+
 def get_initial_active_chats():
     raw_ids = getattr(config, "AUTO_SIGNAL_CHAT_IDS", [])
     active_set = set()
@@ -30,89 +31,91 @@ def get_initial_active_chats():
             pass
     return active_set
 
-# Dynamic set of Chat IDs that currently have Auto Signal turned ON
+
 ACTIVE_AUTO_SCAN_CHATS = get_initial_active_chats()
 
 
 async def post_init(application) -> None:
     commands = [
-        BotCommand("start", "Show Forex & Crypto pairs & Auto-Signal control"),
-        BotCommand("signal", "Get signal for any pair (e.g. /signal BTCUSDT)"),
-        BotCommand("autoon", "Turn ON automated background signals"),
-        BotCommand("autooff", "Turn OFF automated background signals"),
-        BotCommand("myid", "Get your Telegram Chat ID for auto signals"),
+        BotCommand("start", "Show Exness AI Trading Panel"),
+        BotCommand("signal", "Get live AI trade & reasoning (e.g. /signal XAU/USD)"),
+        BotCommand("autoon", "Turn ON automated Exness signals & reversal alerts"),
+        BotCommand("autooff", "Turn OFF automated signals"),
+        BotCommand("active", "View currently tracked active trades"),
+        BotCommand("myid", "Get your Telegram Chat ID"),
     ]
     await application.bot.set_my_commands(commands)
 
 
 async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Utility command to get user's Chat ID for config.py / Railway"""
     chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        f"🆔 Your Telegram Chat ID: `{chat_id}`\n\nAdd this ID to Railway `AUTO_SIGNAL_CHAT_ID` variable.",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"🆔 Your Telegram Chat ID: `{chat_id}`", parse_mode="Markdown")
+
+
+async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ACTIVE_OPEN_TRADES:
+        await update.message.reply_text("ℹ️ No active trades currently tracked.", parse_mode="Markdown")
+        return
+
+    msg = "📊 **ACTIVE TRACKED TRADES (EXNESS)**\n\n"
+    for sym, tr in ACTIVE_OPEN_TRADES.items():
+        emoji = "🟢" if tr['signal'] == "BUY" else "🔴"
+        msg += (
+            f"{emoji} **{sym} ({tr['signal']})**\n"
+            f"• Entry Price: `{tr['price']:.5f}`\n"
+            f"• SL: `{tr['stop_loss']:.5f}` | TP: `{tr['take_profit']:.5f}`\n\n"
+        )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def autoon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to enable Auto Signals for THIS specific chat only"""
     chat_id = update.effective_chat.id
     ACTIVE_AUTO_SCAN_CHATS.add(chat_id)
-    msg = "🟢 **Auto Signals TURNED ON for this chat!**\n\nYou will now receive automated signals."
+    msg = "🟢 **Auto Signals & Live Reversal Monitoring TURNED ON!**"
     if update.message:
         await update.message.reply_text(msg, parse_mode="Markdown")
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def autooff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to disable Auto Signals for THIS specific chat only"""
     chat_id = update.effective_chat.id
     ACTIVE_AUTO_SCAN_CHATS.discard(chat_id)
-    msg = "🔴 **Auto Signals TURNED OFF for this chat!**\n\nAutomated background alerts are paused for you. Manual `/signal` and buttons will still work normally."
+    msg = "🔴 **Auto Signals TURNED OFF!**"
     if update.message:
         await update.message.reply_text(msg, parse_mode="Markdown")
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     is_active = chat_id in ACTIVE_AUTO_SCAN_CHATS
-    
     status_str = "🟢 ON" if is_active else "🔴 OFF"
+
     toggle_button = (
-        InlineKeyboardButton("🔴 Turn OFF Auto Signal", callback_data="toggle_auto_off")
+        InlineKeyboardButton("🔴 Turn OFF Auto Scanner", callback_data="toggle_auto_off")
         if is_active
-        else InlineKeyboardButton("🟢 Turn ON Auto Signal", callback_data="toggle_auto_on")
+        else InlineKeyboardButton("🟢 Turn ON Auto Scanner", callback_data="toggle_auto_on")
     )
 
     keyboard = [
         [toggle_button],
         [
+            InlineKeyboardButton("🥇 Gold (XAU/USD)", callback_data="sig_XAU/USD"),
             InlineKeyboardButton("⚡ BTC/USDT", callback_data="sig_BTCUSDT"),
-            InlineKeyboardButton("💎 ETH/USDT", callback_data="sig_ETHUSDT"),
-            InlineKeyboardButton("🚀 SOL/USDT", callback_data="sig_SOLUSDT"),
         ],
         [
-            InlineKeyboardButton("🥇 XAU/USD (Gold)", callback_data="sig_XAU/USD"),
             InlineKeyboardButton("💶 EUR/USD", callback_data="sig_EUR/USD"),
             InlineKeyboardButton("💷 GBP/USD", callback_data="sig_GBP/USD"),
-        ],
-        [
             InlineKeyboardButton("💴 USD/JPY", callback_data="sig_USD/JPY"),
-            InlineKeyboardButton("🇨🇦 USD/CAD", callback_data="sig_USD/CAD"),
-            InlineKeyboardButton("🇦🇺 AUD/USD", callback_data="sig_AUD/USD"),
-        ],
+        ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg = (
-        f"⚡ **Institutional AI Scalping Bot**\n\n"
-        f"🤖 **Your Auto-Signal Status:** `{status_str}`\n\n"
-        f"• Toggle Auto Signal: Use buttons above or `/autoon` / `/autooff`\n"
-        f"• Manual Check: Click pair buttons or type `/signal BTCUSDT`\n"
-        f"• Get Chat ID: `/myid`"
+        f"🧠 **EXNESS INSTITUTIONAL AI TRADING BOT**\n\n"
+        f"🤖 **Auto Scanner Status:** `{status_str}`\n"
+        f"🎯 **Exness Protection:** Spread Buffer & Slippage Guard Active\n\n"
+        f"• Instant Analysis: Click buttons below or `/signal XAU/USD`\n"
+        f"• Active Trade List: `/active`\n"
+        f"• Auto Scan Control: `/autoon` / `/autooff`"
     )
     if update.message:
         await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
@@ -121,13 +124,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
-    """Always works for manual checks regardless of Auto-Signal ON/OFF status."""
     status_msg = None
     try:
         if update.message:
-            status_msg = await update.message.reply_text(f"⏳ Analyzing `{symbol}` with AI...", parse_mode="Markdown")
+            status_msg = await update.message.reply_text(f"🧠 Exness AI is analyzing `{symbol}`...", parse_mode="Markdown")
         elif update.callback_query:
-            status_msg = await update.callback_query.message.reply_text(f"⏳ Analyzing `{symbol}` with AI...", parse_mode="Markdown")
+            status_msg = await update.callback_query.message.reply_text(f"🧠 Exness AI is analyzing `{symbol}`...", parse_mode="Markdown")
 
         entry_df, trend_df = df_fetcher.get_data(symbol)
 
@@ -141,33 +143,32 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
         signal_type = analysis.get("signal", "HOLD")
         price = analysis.get("price", 0.0)
 
-        if signal_type == "BUY":
+        if signal_type in ["BUY", "SELL"]:
+            # Save trade in active tracker
+            ACTIVE_OPEN_TRADES[symbol] = {
+                "signal": signal_type,
+                "price": price,
+                "stop_loss": analysis['stop_loss'],
+                "take_profit": analysis['take_profit']
+            }
+
             reasons_text = "\n".join([f"• {r}" for r in analysis.get("reasons", [])])
+            emoji = "🟢" if signal_type == "BUY" else "🔴"
             out_msg = (
-                f"🟢 **BUY SIGNAL: {symbol}**\n\n"
-                f"💰 Entry Price: `{price:.5f}`\n"
-                f"🛑 Stop Loss: `{analysis['stop_loss']:.5f}`\n"
-                f"🎯 Take Profit: `{analysis['take_profit']:.5f}`\n"
-                f"⚖️ Risk/Reward: `1:{analysis['rr_ratio']}`\n\n"
-                f"📋 **Analysis:**\n{reasons_text}"
-            )
-        elif signal_type == "SELL":
-            reasons_text = "\n".join([f"• {r}" for r in analysis.get("reasons", [])])
-            out_msg = (
-                f"🔴 **SELL SIGNAL: {symbol}**\n\n"
-                f"💰 Entry Price: `{price:.5f}`\n"
-                f"🛑 Stop Loss: `{analysis['stop_loss']:.5f}`\n"
-                f"🎯 Take Profit: `{analysis['take_profit']:.5f}`\n"
-                f"⚖️ Risk/Reward: `1:{analysis['rr_ratio']}`\n\n"
-                f"📋 **Analysis:**\n{reasons_text}"
+                f"{emoji} **EXNESS {signal_type} SIGNAL: {symbol}**\n\n"
+                f"💰 **Entry Price:** `{price:.5f}`\n"
+                f"🛑 **Stop Loss (Exness Buffered):** `{analysis['stop_loss']:.5f}`\n"
+                f"🎯 **Take Profit:** `{analysis['take_profit']:.5f}`\n"
+                f"⚖️ **Risk/Reward:** `1:{analysis['rr_ratio']}`\n\n"
+                f"🧠 **TRADE REASONING & BRAIN ANALYSIS:**\n{reasons_text}"
             )
         else:
             reason = analysis['reasons'][0] if analysis.get('reasons') else "No setup found."
             out_msg = (
-                f"🟡 **HOLD / NO SETUP: {symbol}**\n\n"
+                f"🟡 **HOLD / NO TRADE: {symbol}**\n\n"
                 f"💰 Current Price: `{price:.5f}`\n"
                 f"📊 HTF Trend: `{analysis.get('trend_bias', 'neutral').upper()}`\n"
-                f"ℹ️ {reason}"
+                f"🧠 **AI Reason:** {reason}"
             )
 
         if status_msg:
@@ -180,51 +181,108 @@ async def process_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, sym
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background task: Only sends alerts to Chat IDs that have Auto-Scan ACTIVE."""
+    """Background Job: Scans for NEW Signals AND Monitors ACTIVE Trades for Early Close."""
     if not ACTIVE_AUTO_SCAN_CHATS:
         return
 
-    pairs = getattr(config, "AUTO_SCAN_PAIRS", ["BTCUSDT", "XAU/USD", "EUR/USD"])
+    pairs = getattr(config, "AUTO_SCAN_PAIRS", ["XAU/USD", "BTCUSDT", "EUR/USD"])
 
     for symbol in pairs:
         try:
-            if not ACTIVE_AUTO_SCAN_CHATS:
-                break
-
             entry_df, trend_df = df_fetcher.get_data(symbol)
             if entry_df is None or entry_df.empty or trend_df is None or trend_df.empty:
                 continue
 
-            analysis = await strategy.analyze(entry_df, trend_df, symbol)
-            signal_type = analysis.get("signal", "HOLD")
+            last_price = entry_df.iloc[-1]["close"]
 
-            if signal_type in ["BUY", "SELL"]:
-                last_candle_time = str(entry_df.iloc[-1]["time"])
-                cache_key = f"{symbol}_{signal_type}_{last_candle_time}"
+            # --- STEP 1: MONITOR ACTIVE TRADES FOR REVERSAL OR TP/SL HIT ---
+            if symbol in ACTIVE_OPEN_TRADES:
+                active_tr = ACTIVE_OPEN_TRADES[symbol]
+                sig = active_tr["signal"]
+                sl = active_tr["stop_loss"]
+                tp = active_tr["take_profit"]
 
-                if last_sent_signals.get(symbol) != cache_key:
-                    last_sent_signals[symbol] = cache_key
+                close_needed = False
+                close_reason = ""
 
+                # Check SL / TP Hit physically
+                if sig == "BUY":
+                    if last_price <= sl:
+                        close_needed = True
+                        close_reason = "🛑 Stop Loss hit on Exness market."
+                    elif last_price >= tp:
+                        close_needed = True
+                        close_reason = "🎯 Take Profit hit successfully!"
+                elif sig == "SELL":
+                    if last_price >= sl:
+                        close_needed = True
+                        close_reason = "🛑 Stop Loss hit on Exness market."
+                    elif last_price <= tp:
+                        close_needed = True
+                        close_reason = "🎯 Take Profit hit successfully!"
+
+                # Check AI Trend Reversal
+                if not close_needed:
+                    summary = {
+                        "last_price": last_price,
+                        "htf_bias": ind.get_htf_bias(trend_df),
+                        "patterns": [ind.detect_rejection_candle(entry_df), ind.detect_fvg(entry_df)],
+                        "volume_status": "High" if ind.has_above_avg_volume(entry_df) else "Normal"
+                    }
+                    ai_check = await ai_analyzer.check_active_trade_reversal(symbol, active_tr, summary)
+                    if ai_check.get("action") == "CLOSE":
+                        close_needed = True
+                        close_reason = f"⚠️ Market Trend Reversed / Structure Invalidation!\n• {ai_check.get('reason')}"
+
+                # Send Telegram CLOSE ALERT if required
+                if close_needed:
+                    close_msg = (
+                        f"🚨 **EXNESS TRADE ALERT: CLOSE {symbol} IMMEDIATELY** 🚨\n\n"
+                        f"📌 **Active Trade:** {sig} at `{active_tr['price']:.5f}`\n"
+                        f"💰 **Current Price:** `{last_price:.5f}`\n\n"
+                        f"⚠️ **REASON TO CLOSE:**\n{close_reason}"
+                    )
+                    del ACTIVE_OPEN_TRADES[symbol]  # Remove from active tracking
+
+                    for cid in list(ACTIVE_AUTO_SCAN_CHATS):
+                        try:
+                            await context.bot.send_message(chat_id=cid, text=close_msg, parse_mode="Markdown")
+                        except Exception as e:
+                            logger.error(f"Failed sending alert to {cid}: {e}")
+
+            # --- STEP 2: SCAN FOR NEW BUY/SELL SIGNALS ---
+            else:
+                analysis = await strategy.analyze(entry_df, trend_df, symbol)
+                signal_type = analysis.get("signal", "HOLD")
+
+                if signal_type in ["BUY", "SELL"]:
                     price = analysis.get("price", 0.0)
                     reasons_text = "\n".join([f"• {r}" for r in analysis.get("reasons", [])])
                     emoji = "🟢" if signal_type == "BUY" else "🔴"
 
+                    # Save in active memory
+                    ACTIVE_OPEN_TRADES[symbol] = {
+                        "signal": signal_type,
+                        "price": price,
+                        "stop_loss": analysis['stop_loss'],
+                        "take_profit": analysis['take_profit']
+                    }
+
                     alert_msg = (
-                        f"🚨 **AUTOMATED AI TRADING SIGNAL** 🚨\n\n"
+                        f"🚨 **AUTOMATED EXNESS AI SIGNAL** 🚨\n\n"
                         f"{emoji} **{signal_type} SIGNAL: {symbol}**\n\n"
-                        f"💰 Entry Price: `{price:.5f}`\n"
-                        f"🛑 Stop Loss: `{analysis['stop_loss']:.5f}`\n"
-                        f"🎯 Take Profit: `{analysis['take_profit']:.5f}`\n"
-                        f"⚖️ Risk/Reward: `1:{analysis['rr_ratio']}`\n\n"
-                        f"📋 **Analysis:**\n{reasons_text}"
+                        f"💰 **Entry Price:** `{price:.5f}`\n"
+                        f"🛑 **Stop Loss (Exness Buffered):** `{analysis['stop_loss']:.5f}`\n"
+                        f"🎯 **Take Profit:** `{analysis['take_profit']:.5f}`\n"
+                        f"⚖️ **Risk/Reward:** `1:{analysis['rr_ratio']}`\n\n"
+                        f"🧠 **TRADE REASONING & BRAIN ANALYSIS:**\n{reasons_text}"
                     )
 
-                    # Send ONLY to users who have Auto Signal ON
                     for cid in list(ACTIVE_AUTO_SCAN_CHATS):
                         try:
                             await context.bot.send_message(chat_id=cid, text=alert_msg, parse_mode="Markdown")
-                        except Exception as send_err:
-                            logger.error(f"Failed to send alert to chat_id {cid}: {send_err}")
+                        except Exception as e:
+                            logger.error(f"Failed sending new signal to {cid}: {e}")
 
         except Exception as e:
             logger.error(f"Auto scan error for {symbol}: {e}")
@@ -232,7 +290,7 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/signal <SYMBOL>`\nExample: `/signal BTCUSDT`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Usage: `/signal <SYMBOL>`\nExample: `/signal XAU/USD`", parse_mode="Markdown")
         return
     symbol = context.args[0].upper()
     await process_signal(update, context, symbol)
@@ -262,6 +320,7 @@ def build_app():
     application.add_handler(CommandHandler("signal", signal_command))
     application.add_handler(CommandHandler("autoon", autoon_command))
     application.add_handler(CommandHandler("autooff", autooff_command))
+    application.add_handler(CommandHandler("active", active_command))
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CallbackQueryHandler(button_callback))
 
@@ -269,8 +328,8 @@ def build_app():
     if job_queue:
         job_queue.run_repeating(
             auto_scan_job,
-            interval=getattr(config, "AUTO_SCAN_INTERVAL", 60),
-            first=10
+            interval=getattr(config, "AUTO_SCAN_INTERVAL", 30),
+            first=5
         )
 
     return application
