@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 def _fetch_gemini_response(url: str, payload: dict, headers: dict):
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response = requests.post(url, json=payload, headers=headers, timeout=12)
         if response.status_code == 200:
             return response.json()
         logger.error(f"Gemini API Error {response.status_code}: {response.text}")
@@ -21,36 +21,47 @@ def _fetch_gemini_response(url: str, payload: dict, headers: dict):
 async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
     api_key = getattr(config, "GEMINI_API_KEY", "")
     if not api_key:
-        logger.warning("GEMINI_API_KEY missing. Falling back to technical rules.")
+        logger.warning("GEMINI_API_KEY missing.")
         return None
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
 
     prompt = f"""
-    You are an elite Institutional SMC (Smart Money Concepts) Scalper.
-    Analyze live market context for {symbol}:
+    You are an Elite Institutional Trader & Fundamental/Technical Analyst.
+    Analyze live multi-asset setup for symbol: {symbol}
+
+    --- 📊 TECHNICAL DATA ---
     - Current Price: {market_summary.get('last_price')}
     - 15m HTF Trend: {market_summary.get('htf_bias')}
-    - Candlestick Patterns: {market_summary.get('patterns')}
-    - Volume Spike: {market_summary.get('volume_status')}
-    - Recent Swing High: {market_summary.get('swing_high')}
-    - Recent Swing Low: {market_summary.get('swing_low')}
-    - ATR Volatility: {market_summary.get('atr')}
-    - Golden Pocket Retracement: {market_summary.get('golden_pocket')}
+    - Price Action Patterns: {market_summary.get('patterns')}
+    - Volume Spike Status: {market_summary.get('volume_status')}
+    - Swing High: {market_summary.get('swing_high')} | Swing Low: {market_summary.get('swing_low')}
+    - 14-ATR Volatility: {market_summary.get('atr')}
+    - Golden Pocket Zone: {market_summary.get('golden_pocket')}
 
-    STRICT TRADING RULES FOR HIGH WIN-RATE:
-    1. DEFAULT TO "HOLD" 80% OF THE TIME. Only give BUY or SELL if 15m Trend, Volume Spike, AND Patterns ALL align together.
-    2. NEVER counter-trend trade against 15m HTF Trend.
-    3. Stop Loss MUST be placed beyond the swing high/low with ATR breathing room.
-    4. Provide confidence rating from 0 to 100. If confidence < 80, force signal to "HOLD".
+    --- 📰 NEWS & FUNDAMENTAL CONTEXT ---
+    - Currency / Asset Category: {market_summary.get('news_data', {}).get('currency')}
+    - News Status: {market_summary.get('news_data', {}).get('news_status')}
+    - Recent/Upcoming Events: {market_summary.get('news_data', {}).get('upcoming_events')}
 
-    Return ONLY a raw JSON object with no markdown formatting:
+    --- 🎯 STRICT TRADING RULES ---
+    1. HIGH IMPACT NEWS FILTER: If high impact news (NFP, CPI, Rate Decision, FOMC) is due in < 30 mins, RETURN SIGNAL "HOLD" due to high slippage risk.
+    2. FUNDAMENTAL ALIGNMENT:
+       - For Gold (XAU/USD) & BTC: If USD strength/news is bullish, Gold & BTC bias should be Bearish.
+       - For Forex: Match base/quote currency news sentiment (Previous vs Forecast/Actual).
+    3. TECHNICAL CONFLUENCE: Must align with 15m Trend + SMC Liquidity Sweep / Volume Spike.
+    4. Minimum Confidence required for BUY/SELL is 85%. Otherwise, set signal to "HOLD".
+
+    Return ONLY raw JSON with no markdown block formatting:
     {{
       "signal": "BUY" | "SELL" | "HOLD",
       "confidence": number (0 to 100),
       "stop_loss": number,
       "take_profit": number,
-      "reasons": ["Confluence 1", "Confluence 2"]
+      "reasons": [
+        "Technical reason (e.g., 15m Trend + Volume)",
+        "Fundamental/News reason (e.g., USD Sentiment/CPI Data Impact)"
+      ]
     }}
     """
 
@@ -70,12 +81,11 @@ async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
             raw_text = raw_text.replace("```", "").strip()
 
         parsed = json.loads(raw_text)
-        
-        # Force HOLD if AI confidence is below threshold
-        min_conf = getattr(config, "MIN_AI_CONFIDENCE", 80)
+
+        min_conf = getattr(config, "MIN_AI_CONFIDENCE", 85)
         if parsed.get("confidence", 0) < min_conf:
             parsed["signal"] = "HOLD"
-            parsed["reasons"] = [f"Confidence ({parsed.get('confidence')}%) below required {min_conf}% threshold for high accuracy."]
+            parsed["reasons"] = [f"Confidence ({parsed.get('confidence')}%) below strict {min_conf}% threshold (News/Technical mismatch)."]
 
         return parsed
     except Exception as e:
