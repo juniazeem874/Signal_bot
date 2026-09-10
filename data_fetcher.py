@@ -6,10 +6,12 @@ import config
 
 logger = logging.getLogger(__name__)
 
-BINANCE_INTERVAL_MAP = {"1min": "1m", "5min": "5m", "15min": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
-YFINANCE_INTERVAL_MAP = {"1min": "1m", "5min": "5m", "15min": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+BINANCE_INTERVAL_MAP = {"1m": "1m", "1min": "1m", "15m": "15m", "15min": "15m"}
+YFINANCE_INTERVAL_MAP = {"1m": "1m", "1min": "1m", "15m": "15m", "15min": "15m"}
+TWELVEDATA_INTERVAL_MAP = {"1m": "1min", "1min": "1min", "15m": "15min", "15min": "15min"}
 
-def fetch_binance_crypto(symbol: str, interval="1min", outputsize=100):
+
+def fetch_binance_crypto(symbol: str, interval="1m", outputsize=100):
     clean_symbol = symbol.replace("/", "").replace("-", "").upper()
     if clean_symbol.endswith("USD") and not clean_symbol.endswith("USDT"):
         clean_symbol += "T"
@@ -48,7 +50,8 @@ def fetch_twelvedata_forex(symbol: str, interval="1min", outputsize=100):
     if not api_key:
         return None
 
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={api_key}"
+    td_interval = TWELVEDATA_INTERVAL_MAP.get(interval, "1min")
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={td_interval}&outputsize={outputsize}&apikey={api_key}"
 
     try:
         res = requests.get(url, timeout=10)
@@ -71,7 +74,7 @@ def fetch_twelvedata_forex(symbol: str, interval="1min", outputsize=100):
         return None
 
 
-def fetch_yfinance_forex(symbol: str, interval="1min", outputsize=100):
+def fetch_yfinance_forex(symbol: str, interval="1m", outputsize=100):
     yf_interval = YFINANCE_INTERVAL_MAP.get(interval, "1m")
     period = "1d" if yf_interval in ["1m", "5m"] else "5d"
 
@@ -115,16 +118,29 @@ def fetch_yfinance_forex(symbol: str, interval="1min", outputsize=100):
     return None
 
 
-def get_data(symbol: str, interval="1min", outputsize=100):
+def fetch_tf_data(symbol: str, interval: str):
+    """Helper function to fetch a single timeframe."""
     crypto_keywords = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "USDT"]
     is_crypto = any(coin in symbol.upper() for coin in crypto_keywords)
 
     if is_crypto:
-        return fetch_binance_crypto(symbol, interval, outputsize)
+        return fetch_binance_crypto(symbol, interval)
 
-    df = fetch_twelvedata_forex(symbol, interval, outputsize)
-
+    df = fetch_twelvedata_forex(symbol, interval)
     if df is None or df.empty:
-        df = fetch_yfinance_forex(symbol, interval, outputsize)
+        df = fetch_yfinance_forex(symbol, interval)
 
     return df
+
+
+def get_data(symbol: str):
+    """
+    Main router function for bot.
+    Fetches both 1m (entry) and 15m (trend) timeframes.
+    Guarantees returning a 2-tuple (entry_df, trend_df).
+    """
+    entry_df = fetch_tf_data(symbol, interval="1m")
+    trend_df = fetch_tf_data(symbol, interval="15m")
+
+    # Safe return to avoid unpack NoneType error
+    return entry_df, trend_df
