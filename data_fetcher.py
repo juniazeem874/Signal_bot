@@ -11,6 +11,15 @@ YFINANCE_INTERVAL_MAP = {"1m": "1m", "1min": "1m", "15m": "15m", "15min": "15m"}
 TWELVEDATA_INTERVAL_MAP = {"1m": "1min", "1min": "1min", "15m": "15min", "15min": "15min"}
 
 
+def normalize_forex_symbol(symbol: str) -> str:
+    """'XAUUSD' -> 'XAU/USD', 'EURUSD' -> 'EUR/USD'. Leaves already-slashed
+    symbols and anything non-6-letter alone."""
+    s = symbol.upper().strip()
+    if "/" in s or len(s) != 6:
+        return s
+    return f"{s[:3]}/{s[3:]}"
+
+
 def fetch_binance_crypto(symbol: str, interval="1m", outputsize=100):
     try:
         clean_symbol = symbol.replace("/", "").replace("-", "").upper()
@@ -24,10 +33,14 @@ def fetch_binance_crypto(symbol: str, interval="1m", outputsize=100):
 
         res = requests.get(url, timeout=10)
         if res.status_code != 200:
+            # Common on cloud hosts (Railway/Render/AWS/GCP IPs): Binance
+            # returns 451/403 "Service unavailable from a restricted location".
+            logger.error(f"Binance HTTP {res.status_code} for {clean_symbol}: {res.text[:200]}")
             return None
 
         data = res.json()
         if not isinstance(data, list) or len(data) == 0:
+            logger.error(f"Binance returned no candle data for {clean_symbol}: {data}")
             return None
 
         df = pd.DataFrame(data, columns=[
@@ -49,6 +62,7 @@ def fetch_twelvedata_forex(symbol: str, interval="1min", outputsize=100):
     try:
         api_key = getattr(config, "TWELVEDATA_API_KEY", "")
         if not api_key:
+            logger.warning("TWELVEDATA_API_KEY not set — skipping TwelveData.")
             return None
 
         td_interval = TWELVEDATA_INTERVAL_MAP.get(interval, "1min")
@@ -58,6 +72,7 @@ def fetch_twelvedata_forex(symbol: str, interval="1min", outputsize=100):
         data = res.json()
 
         if "values" not in data:
+            logger.error(f"TwelveData no data for {symbol}: {data}")
             return None
 
         df = pd.DataFrame(data["values"])
@@ -80,7 +95,7 @@ def fetch_yfinance_forex(symbol: str, interval="1m", outputsize=100):
         period = "1d" if yf_interval in ["1m", "5m"] else "5d"
 
         if symbol.upper() in ["XAU/USD", "XAUUSD", "GOLD"]:
-            tickers_to_try = ["XAUUSD=X", "XAU-USD"]
+            tickers_to_try = ["XAUUSD=X", "XAU-USD", "GC=F"]
         elif "/" in symbol:
             tickers_to_try = [symbol.replace("/", "") + "=X"]
         else:
@@ -112,10 +127,56 @@ def fetch_yfinance_forex(symbol: str, interval="1m", outputsize=100):
                             df[col] = df[col].astype(float)
 
                     return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+            else:
+                logger.warning(f"Yahoo Finance empty for ticker {ticker} (interval={yf_interval})")
     except Exception as e:
         logger.error(f"Yahoo Finance error for {symbol}: {e}")
 
     return None
+
+
+def fetch_yfinance_crypto(symbol: str, interval="1m", outputsize=100):
+    """Fallback crypto source when Binance is unreachable/blocked (common on
+    cloud hosts like Railway, which Binance sometimes geo/IP-blocks)."""
+    try:
+        yf_interval = YFINANCE_INTERVAL_MAP.get(interval, "1m")
+        period = "1d" if yf_interval in ["1m", "5m"] else "5d"
+
+        clean = symbol.upper().replace("/", "").replace("-", "")
+        for suffix in ["USDT", "BUSD", "USD"]:
+            if clean.endswith(suffix):
+                clean = clean[: -len(suffix)]
+                break
+        ticker = f"{clean}-USD"
+
+        df = yf.download(ticker, period=period, interval=yf_interval, progress=False)
+        if df is None or df.empty:
+            logger.warning(f"Yahoo Finance empty for crypto ticker {ticker}")
+            return None
+
+        df = df.reset_index()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+
+        time_col = "Datetime" if "Datetime" in df.columns else "Date"
+        if time_col not in df.columns:
+            return None
+
+        df = df.rename(columns={
+            time_col: "time", "Open": "open", "High": "high",
+            "Low": "low", "Close": "close", "Volume": "volume"
+        })
+        df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+        df = df.tail(outputsize).reset_index(drop=True)
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+
+        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+    except Exception as e:
+        logger.error(f"Yahoo Finance crypto error for {symbol}: {e}")
+        return None
 
 
 def fetch_tf_data(symbol: str, interval: str):
@@ -123,11 +184,16 @@ def fetch_tf_data(symbol: str, interval: str):
     is_crypto = any(coin in symbol.upper() for coin in crypto_keywords)
 
     if is_crypto:
-        return fetch_binance_crypto(symbol, interval)
+        df = fetch_binance_crypto(symbol, interval)
+        if df is None or df.empty:
+            logger.warning(f"Binance failed for {symbol} — falling back to Yahoo Finance.")
+            df = fetch_yfinance_crypto(symbol, interval)
+        return df
 
-    df = fetch_twelvedata_forex(symbol, interval)
+    norm_symbol = normalize_forex_symbol(symbol)
+    df = fetch_twelvedata_forex(norm_symbol, interval)
     if df is None or df.empty:
-        df = fetch_yfinance_forex(symbol, interval)
+        df = fetch_yfinance_forex(norm_symbol, interval)
 
     return df
 
@@ -140,6 +206,12 @@ def get_data(symbol: str):
     try:
         entry_df = fetch_tf_data(symbol, interval="1m")
         trend_df = fetch_tf_data(symbol, interval="15m")
+        if entry_df is None or trend_df is None:
+            logger.error(
+                f"get_data({symbol}) failed — entry_df is None: {entry_df is None}, "
+                f"trend_df is None: {trend_df is None}. Check the logs above for the "
+                f"specific source error (Binance/TwelveData/Yahoo)."
+            )
         return entry_df, trend_df
     except Exception as e:
         logger.error(f"Error fetching data for {symbol}: {e}")
