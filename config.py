@@ -5,6 +5,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "goldapi-251c13464305698003f71af084a5c3a9-io")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")  # free key from finnhub.io — powers real economic-calendar news
 
 # ---- Timeframes ----
 ENTRY_INTERVAL_BINANCE = "1m"
@@ -52,7 +53,7 @@ FOREX_PAIRS = [
 
 # ---- Auto Scan Settings ----
 AUTO_SCAN_ENABLED = True
-AUTO_SCAN_INTERVAL = 30  # Scan every 30 seconds for live active trade tracking
+AUTO_SCAN_INTERVAL = 60  # Scan every 60 seconds (1 minute) for live active trade tracking
 
 raw_chat_ids = os.getenv("AUTO_SIGNAL_CHAT_ID", "")
 AUTO_SIGNAL_CHAT_IDS = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
