@@ -14,9 +14,10 @@ TREND_INTERVAL_TWELVEDATA = "15min"
 CANDLE_LIMIT = 500
 
 # ---- ACCURACY & RISK ACCORDING TO SCALPING ----
-MIN_RISK_REWARD = 1.8         # Realistic TP target for 1m scalping
-MIN_AI_CONFIDENCE = 85        # Minimum 85% AI confidence required for BUY/SELL
+MIN_RISK_REWARD = 1.3         # 1m scalping ke liye realistic TP
+MIN_AI_CONFIDENCE = 70        # Lowered from 85% to 70% so more high-probability trades trigger
 ATR_PERIOD = 14
+
 
 # ---- EXNESS SPREAD BUFFER PADDING (To avoid early SL hits on Exness) ----
 EXNESS_SPREAD_BUFFERS = {
