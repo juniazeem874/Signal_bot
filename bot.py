@@ -187,13 +187,27 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     pairs = getattr(config, "AUTO_SCAN_PAIRS", ["XAU/USD", "BTCUSDT", "EUR/USD"])
 
-    for symbol in pairs:
-        try:
-            entry_df, trend_df = df_fetcher.get_data(symbol)
-            if entry_df is None or entry_df.empty or trend_df is None or trend_df.empty:
-                continue
+    # auto_scan_job loop ke andar:
+for symbol in pairs:
+    try:
+        res = df_fetcher.get_data(symbol)
+        
+        # Unpack Safety Check
+        if not isinstance(res, tuple) or len(res) != 2:
+            logger.warning(f"⚠️ Invalid data format received for {symbol}")
+            continue
 
-            last_price = entry_df.iloc[-1]["close"]
+        entry_df, trend_df = res
+
+        if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
+            logger.warning(f"⚠️ Could not fetch complete market data for {symbol}")
+            continue
+
+        # ... rest of your signal analysis logic ...
+
+    except Exception as e:
+        logger.error(f"Error processing {symbol}: {e}")
+
 
             # --- STEP 1: MONITOR ACTIVE TRADES FOR REVERSAL OR TP/SL HIT ---
             if symbol in ACTIVE_OPEN_TRADES:
