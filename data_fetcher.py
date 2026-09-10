@@ -6,12 +6,25 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Track if TwelveData limit reached for the day
 TWELVEDATA_LIMIT_REACHED = False
 
 
+def normalize_symbol(symbol: str) -> str:
+    """Normalizes input symbols (e.g., 'XAUUSD' -> 'XAU/USD', 'eurusd' -> 'EUR/USD')."""
+    s = symbol.upper().strip()
+    
+    # Handle Gold variations
+    if s in ["XAUUSD", "GOLD", "XAU-USD"]:
+        return "XAU/USD"
+    
+    # Handle 6-character Forex pairs without slash (e.g., EURUSD -> EUR/USD)
+    if len(s) == 6 and not s.endswith("USDT") and "/" not in s:
+        return f"{s[:3]}/{s[3:]}"
+        
+    return s
+
+
 def get_data_binance(symbol: str, interval: str, limit: int = 500):
-    """Fetch Crypto candles directly from Binance."""
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
         res = requests.get(url, timeout=10)
@@ -31,7 +44,6 @@ def get_data_binance(symbol: str, interval: str, limit: int = 500):
 
 
 def get_data_twelvedata(symbol: str, interval: str, limit: int = 500):
-    """Fetch Forex/Gold candles from TwelveData."""
     global TWELVEDATA_LIMIT_REACHED
 
     if TWELVEDATA_LIMIT_REACHED:
@@ -68,6 +80,8 @@ def get_data_yfinance(symbol: str, interval: str = "1m"):
     """UNLIMITED FALLBACK: Dynamic loader for Gold, Crypto & Forex Currency Pairs."""
     yf_symbol_map = {
         "XAU/USD": "GC=F",
+        "XAUUSD": "GC=F",
+        "GOLD": "GC=F",
         "BTCUSDT": "BTC-USD",
         "ETHUSDT": "ETH-USD",
         "SOLUSDT": "SOL-USD",
@@ -106,7 +120,9 @@ def get_data_yfinance(symbol: str, interval: str = "1m"):
 
 
 def get_data(symbol: str):
-    """Main router with automatic failover."""
+    """Main router with automatic symbol normalization & failover."""
+    symbol = normalize_symbol(symbol)
+    
     entry_tf_binance = getattr(config, "ENTRY_INTERVAL_BINANCE", "1m")
     trend_tf_binance = getattr(config, "TREND_INTERVAL_BINANCE", "15m")
     entry_tf_td = getattr(config, "ENTRY_INTERVAL_TWELVEDATA", "1min")
