@@ -8,9 +8,8 @@ logger = logging.getLogger(__name__)
 
 
 def _fetch_gemini_response(url: str, payload: dict, headers: dict):
-    """Internal synchronous function executed in background thread."""
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=8)
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
         if response.status_code == 200:
             return response.json()
         logger.error(f"Gemini API Error {response.status_code}: {response.text}")
@@ -20,29 +19,38 @@ def _fetch_gemini_response(url: str, payload: dict, headers: dict):
 
 
 async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
-    """Async AI analyzer with strict timeout protection."""
     api_key = getattr(config, "GEMINI_API_KEY", "")
     if not api_key:
-        logger.warning("GEMINI_API_KEY missing. Falling back to technical indicators.")
+        logger.warning("GEMINI_API_KEY missing. Falling back to technical rules.")
         return None
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
 
     prompt = f"""
-    You are an expert Institutional Trader. Analyze this market context for {symbol}:
+    You are an elite Institutional SMC (Smart Money Concepts) Scalper.
+    Analyze live market context for {symbol}:
     - Current Price: {market_summary.get('last_price')}
-    - HTF Trend (15m): {market_summary.get('htf_bias')}
-    - Patterns: {market_summary.get('patterns')}
-    - Volume: {market_summary.get('volume_status')}
-    - Golden Pocket: {market_summary.get('golden_pocket')}
+    - 15m HTF Trend: {market_summary.get('htf_bias')}
+    - Candlestick Patterns: {market_summary.get('patterns')}
+    - Volume Spike: {market_summary.get('volume_status')}
+    - Recent Swing High: {market_summary.get('swing_high')}
+    - Recent Swing Low: {market_summary.get('swing_low')}
+    - ATR Volatility: {market_summary.get('atr')}
+    - Golden Pocket Retracement: {market_summary.get('golden_pocket')}
+
+    STRICT TRADING RULES FOR HIGH WIN-RATE:
+    1. DEFAULT TO "HOLD" 80% OF THE TIME. Only give BUY or SELL if 15m Trend, Volume Spike, AND Patterns ALL align together.
+    2. NEVER counter-trend trade against 15m HTF Trend.
+    3. Stop Loss MUST be placed beyond the swing high/low with ATR breathing room.
+    4. Provide confidence rating from 0 to 100. If confidence < 80, force signal to "HOLD".
 
     Return ONLY a raw JSON object with no markdown formatting:
     {{
       "signal": "BUY" | "SELL" | "HOLD",
-      "confidence": number,
+      "confidence": number (0 to 100),
       "stop_loss": number,
       "take_profit": number,
-      "reasons": ["reason 1", "reason 2"]
+      "reasons": ["Confluence 1", "Confluence 2"]
     }}
     """
 
@@ -50,7 +58,6 @@ async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
     headers = {"Content-Type": "application/json"}
 
     try:
-        # Run synchronous requests in a thread to keep Telegram bot responsive
         res_data = await asyncio.to_thread(_fetch_gemini_response, url, payload, headers)
         if not res_data:
             return None
@@ -62,7 +69,15 @@ async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
         elif raw_text.startswith("```"):
             raw_text = raw_text.replace("```", "").strip()
 
-        return json.loads(raw_text)
+        parsed = json.loads(raw_text)
+        
+        # Force HOLD if AI confidence is below threshold
+        min_conf = getattr(config, "MIN_AI_CONFIDENCE", 80)
+        if parsed.get("confidence", 0) < min_conf:
+            parsed["signal"] = "HOLD"
+            parsed["reasons"] = [f"Confidence ({parsed.get('confidence')}%) below required {min_conf}% threshold for high accuracy."]
+
+        return parsed
     except Exception as e:
         logger.error(f"AI Processing Exception for {symbol}: {e}")
         return None
