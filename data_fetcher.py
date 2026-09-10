@@ -7,6 +7,7 @@ import config
 logger = logging.getLogger(__name__)
 
 BINANCE_INTERVAL_MAP = {"1m": "1m", "1min": "1m", "15m": "15m", "15min": "15m"}
+BYBIT_INTERVAL_MAP = {"1m": "1", "1min": "1", "15m": "15", "15min": "15"}
 YFINANCE_INTERVAL_MAP = {"1m": "1m", "1min": "1m", "15m": "15m", "15min": "15m"}
 TWELVEDATA_INTERVAL_MAP = {"1m": "1min", "1min": "1min", "15m": "15min", "15min": "15min"}
 
@@ -55,6 +56,50 @@ def fetch_binance_crypto(symbol: str, interval="1m", outputsize=100):
         return df[['time', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
         logger.error(f"Binance fetch error for {symbol}: {e}")
+        return None
+
+
+def fetch_bybit_crypto(symbol: str, interval="1m", outputsize=100):
+    """Bybit's public spot kline endpoint — no auth needed, and generally not
+    subject to the same geo/cloud-IP blocking Binance applies."""
+    try:
+        clean_symbol = symbol.replace("/", "").replace("-", "").upper()
+        if clean_symbol.endswith("USD") and not clean_symbol.endswith("USDT"):
+            clean_symbol += "T"
+        if not (clean_symbol.endswith("USDT") or clean_symbol.endswith("USDC")):
+            clean_symbol += "USDT"
+
+        b_interval = BYBIT_INTERVAL_MAP.get(interval, "1")
+        url = (
+            f"https://api.bybit.com/v5/market/kline?category=spot"
+            f"&symbol={clean_symbol}&interval={b_interval}&limit={outputsize}"
+        )
+
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            logger.error(f"Bybit HTTP {res.status_code} for {clean_symbol}: {res.text[:200]}")
+            return None
+
+        data = res.json()
+        if data.get("retCode") != 0:
+            logger.error(f"Bybit API error for {clean_symbol}: {data.get('retMsg')}")
+            return None
+
+        rows = data.get("result", {}).get("list", [])
+        if not rows:
+            logger.error(f"Bybit returned no candle data for {clean_symbol}")
+            return None
+
+        df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"])
+        df['time'] = pd.to_datetime(df['open_time'].astype(float), unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+
+        # Bybit returns newest-first — sort ascending like Binance/TwelveData.
+        df = df.sort_values('time').reset_index(drop=True)
+        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+    except Exception as e:
+        logger.error(f"Bybit fetch error for {symbol}: {e}")
         return None
 
 
@@ -186,7 +231,10 @@ def fetch_tf_data(symbol: str, interval: str):
     if is_crypto:
         df = fetch_binance_crypto(symbol, interval)
         if df is None or df.empty:
-            logger.warning(f"Binance failed for {symbol} — falling back to Yahoo Finance.")
+            logger.warning(f"Binance failed for {symbol} — trying Bybit.")
+            df = fetch_bybit_crypto(symbol, interval)
+        if df is None or df.empty:
+            logger.warning(f"Bybit failed for {symbol} — falling back to Yahoo Finance.")
             df = fetch_yfinance_crypto(symbol, interval)
         return df
 
