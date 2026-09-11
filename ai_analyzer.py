@@ -10,19 +10,29 @@ def _fetch_gemini_response(url: str, payload: dict, headers: dict):
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=12)
         if response.status_code == 200:
-            return response.json()
-        logger.error(f"Gemini API Error {response.status_code}: {response.text}")
+            return response.json(), response.status_code
+        logger.error(f"Gemini API Error {response.status_code}: {response.text[:300]}")
+        return None, response.status_code
     except Exception as e:
         logger.error(f"Gemini Request Failed: {e}")
-    return None
+        return None, None
+
+# If the primary model gets retired again in the future, these are tried in
+# order so the bot doesn't go silent the way it did with gemini-1.5-flash.
+GEMINI_MODEL_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-2.5-flash"]
 
 async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
     """Active Exness Scalper Prompt with Balanced Signal Frequency."""
     api_key = getattr(config, "GEMINI_API_KEY", "")
     if not api_key:
+        logger.error(
+            "GEMINI_API_KEY is not set — every signal will silently come back HOLD. "
+            "Set GEMINI_API_KEY in Railway's Environment tab and redeploy."
+        )
         return None
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    primary_model = getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
+    models_to_try = [primary_model] + [m for m in GEMINI_MODEL_FALLBACKS if m != primary_model]
 
     prompt = f"""
     You are an Active Institutional Exness Scalper. Your job is to find active BUY or SELL scalping trades on 1m timeframe using 15m HTF alignment.
@@ -66,7 +76,22 @@ async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
     headers = {"Content-Type": "application/json"}
 
     try:
-        res_data = await asyncio.to_thread(_fetch_gemini_response, url, payload, headers)
+        res_data = None
+        for model_name in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            res_data, status_code = await asyncio.to_thread(_fetch_gemini_response, url, payload, headers)
+            if res_data:
+                if model_name != primary_model:
+                    logger.warning(f"Primary Gemini model '{primary_model}' failed — used fallback '{model_name}' instead.")
+                break
+            if status_code == 404:
+                logger.warning(f"Gemini model '{model_name}' not found/retired — trying next fallback.")
+                continue
+            else:
+                # Non-404 error (bad key, quota, network) won't be fixed by
+                # switching models — no point trying the rest.
+                break
+
         if not res_data:
             return None
 
