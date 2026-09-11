@@ -31,6 +31,45 @@ SCAN_INTERVAL = getattr(config, "AUTO_SCAN_INTERVAL", 60)
 LAST_SIGNALS = {}
 
 
+# ==================== MARKDOWN-SAFE SEND HELPERS ====================
+# AI-generated "reasons" text (and key names with underscores) can contain
+# characters Telegram's legacy Markdown parser chokes on (stray _ * [ ]),
+# which makes send_message/reply_text raise and the handler go silent.
+# These helpers retry as plain text instead of failing silently.
+
+def _strip_markdown(text: str) -> str:
+    for ch in ("**", "`", "_", "*"):
+        text = text.replace(ch, "")
+    return text
+
+
+async def safe_reply(update: Update, text: str, reply_markup=None):
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Markdown reply failed, retrying as plain text: {e}")
+        await update.message.reply_text(_strip_markdown(text), reply_markup=reply_markup)
+
+
+async def safe_edit(query, text: str, reply_markup=None):
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Markdown edit failed, retrying as plain text: {e}")
+        await query.edit_message_text(_strip_markdown(text), reply_markup=reply_markup)
+
+
+async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str):
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Markdown send to {chat_id} failed, retrying as plain text: {e}")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=_strip_markdown(text))
+        except Exception as e2:
+            logger.error(f"Plain-text send to {chat_id} also failed: {e2}")
+
+
 def _format_signal_message(symbol: str, result: dict, header: str) -> str:
     signal = result.get("signal", "HOLD")
     icon = "🟢" if signal == "BUY" else ("🔴" if signal == "SELL" else "⏸️")
@@ -68,14 +107,6 @@ async def _run_analysis(symbol: str) -> str:
     return _format_signal_message(symbol, result, "SIGNAL RESULT")
 
 
-async def _send_to_all(context: ContextTypes.DEFAULT_TYPE, chat_ids, message_text: str):
-    for chat_id in list(chat_ids):
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=message_text, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
-
-
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """Runs every SCAN_INTERVAL seconds via the JobQueue and scans all pairs."""
     bot_data = context.application.bot_data
@@ -106,7 +137,8 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
             LAST_SIGNALS[symbol] = signal_key
 
             msg = _format_signal_message(symbol, result, "AUTOMATED TRADE SIGNAL")
-            await _send_to_all(context, bot_data["active_chat_ids"], msg)
+            for chat_id in list(bot_data["active_chat_ids"]):
+                await safe_send(context, chat_id, msg)
             signals_sent += 1
 
         except Exception as pair_err:
@@ -142,11 +174,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "back:menu":
-        await query.edit_message_text(
-            "🤖 **Trading Signal Bot**\n\nChoose a category:",
-            reply_markup=_category_keyboard(),
-            parse_mode="Markdown"
-        )
+        await safe_edit(query, "🤖 **Trading Signal Bot**\n\nChoose a category:", reply_markup=_category_keyboard())
         return
 
     if data.startswith("cat:"):
@@ -154,22 +182,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cat_key not in CATEGORIES:
             return
         label, _pairs = CATEGORIES[cat_key]
-        await query.edit_message_text(
-            f"{label} — pick a pair for instant analysis:",
-            reply_markup=_pair_keyboard(cat_key),
-            parse_mode="Markdown"
-        )
+        await safe_edit(query, f"{label} — pick a pair for instant analysis:", reply_markup=_pair_keyboard(cat_key))
         return
 
     if data.startswith("pair:"):
         symbol = data.split(":", 1)[1]
-        await query.edit_message_text(f"🔍 Analyzing `{symbol}`...", parse_mode="Markdown")
+        await safe_edit(query, f"🔍 Analyzing `{symbol}`...")
         msg = await _run_analysis(symbol)
-        await query.edit_message_text(
-            msg,
-            reply_markup=_pair_keyboard(_category_of(symbol)),
-            parse_mode="Markdown"
-        )
+        await safe_edit(query, msg, reply_markup=_pair_keyboard(_category_of(symbol)))
 
 
 def _category_of(symbol: str) -> str:
@@ -193,28 +213,23 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"`{len(DEFAULT_PAIRS)}` pairs — you'll get BUY/SELL alerts automatically.\n\n"
         "👇 Tap a category, then a pair, for an instant BUY/SELL/HOLD analysis with reasons.\n\n"
         "Commands:\n"
-        "• `/autoon` `/autooff` - auto signals on/off\n"
-        "• `/signal [PAIR]` - instant manual check (e.g. `/signal BTCUSDT`)\n"
-        "• `/status` - bot status"
+        "• /autoon /autooff - auto signals on/off\n"
+        "• /signal [PAIR] - instant manual check (e.g. /signal BTCUSDT)\n"
+        "• /status - bot status"
     )
-    await update.message.reply_text(
-        welcome_msg, reply_markup=_category_keyboard(), parse_mode="Markdown"
-    )
+    await safe_reply(update, welcome_msg, reply_markup=_category_keyboard())
 
 
 async def enable_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_data = context.application.bot_data
     bot_data["auto_trade_enabled"] = True
     bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
-    await update.message.reply_text(
-        "✅ **Auto-Trade Mode Activated!**\nBot ab background mein market scan karke alerts bheje ga.",
-        parse_mode="Markdown"
-    )
+    await safe_reply(update, "✅ **Auto-Trade Mode Activated!**\nBot ab background mein market scan karke alerts bheje ga.")
 
 
 async def disable_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.bot_data["auto_trade_enabled"] = False
-    await update.message.reply_text("🛑 **Auto-Trade Mode Deactivated.**", parse_mode="Markdown")
+    await safe_reply(update, "🛑 **Auto-Trade Mode Deactivated.**")
 
 
 def _key_status(name: str, value: str) -> str:
@@ -232,33 +247,33 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     openrouter_status = _key_status("OPENROUTER_API_KEY", getattr(config, "OPENROUTER_API_KEY", ""))
     goldapi_status = _key_status("GOLDAPI_KEY", getattr(config, "GOLDAPI_KEY", ""))
 
-    await update.message.reply_text(
-        f"📊 **Bot Status:**\n"
-        f"Auto-Trade: `{status_str}`\n"
-        f"Scan Interval: `{SCAN_INTERVAL}s`\n"
-        f"Tracked Pairs: `{len(DEFAULT_PAIRS)}`\n\n"
-        f"**API Keys:**\n"
-        f"GEMINI_API_KEY: {gemini_status} (primary AI)\n"
-        f"OPENROUTER_API_KEY: {openrouter_status} (AI fallback)\n"
-        f"TWELVEDATA_API_KEY: {twelvedata_status}\n"
-        f"FINNHUB_API_KEY: {finnhub_status}\n"
-        f"GOLDAPI_KEY: {goldapi_status} (live gold/silver price)\n\n"
-        f"⚠️ If GEMINI_API_KEY is MISSING and OPENROUTER_API_KEY is also MISSING, "
-        f"every scan silently returns HOLD and no signal is ever sent.",
-        parse_mode="Markdown"
+    msg = (
+        f"📊 Bot Status:\n"
+        f"Auto-Trade: {status_str}\n"
+        f"Scan Interval: {SCAN_INTERVAL}s\n"
+        f"Tracked Pairs: {len(DEFAULT_PAIRS)}\n\n"
+        f"API Keys:\n"
+        f"`GEMINI_API_KEY`: {gemini_status} (primary AI)\n"
+        f"`OPENROUTER_API_KEY`: {openrouter_status} (AI fallback)\n"
+        f"`TWELVEDATA_API_KEY`: {twelvedata_status}\n"
+        f"`FINNHUB_API_KEY`: {finnhub_status}\n"
+        f"`GOLDAPI_KEY`: {goldapi_status} (live gold/silver price)\n\n"
+        f"If GEMINI_API_KEY and OPENROUTER_API_KEY are both MISSING, every "
+        f"scan silently returns HOLD and no signal is ever sent."
     )
+    await safe_reply(update, msg)
 
 
 async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Single pair ka instant signal check karta hai."""
     symbol = context.args[0].upper() if context.args else "BTCUSDT"
-    await update.message.reply_text(f"🔍 Fetching analysis for `{symbol}`...", parse_mode="Markdown")
+    await safe_reply(update, f"🔍 Fetching analysis for `{symbol}`...")
     try:
         msg = await _run_analysis(symbol)
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await safe_reply(update, msg)
     except Exception as e:
         logger.error(f"Manual signal error for {symbol}: {e}")
-        await update.message.reply_text(f"⚠️ Error: {e}")
+        await safe_reply(update, f"⚠️ Error: {e}")
 
 
 # ==================== APP BUILDER ====================
