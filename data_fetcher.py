@@ -117,7 +117,11 @@ def fetch_twelvedata_forex(symbol: str, interval="1min", outputsize=100):
         data = res.json()
 
         if "values" not in data:
-            logger.error(f"TwelveData no data for {symbol}: {data}")
+            msg = str(data.get("message", ""))
+            if data.get("code") == 429 or "credit" in msg.lower() or "run out" in msg.lower():
+                logger.warning(f"TwelveData daily/minute quota exhausted for {symbol}: {msg} — falling back.")
+            else:
+                logger.error(f"TwelveData no data for {symbol}: {data}")
             return None
 
         df = pd.DataFrame(data["values"])
@@ -221,6 +225,27 @@ def fetch_yfinance_crypto(symbol: str, interval="1m", outputsize=100):
         return df[['time', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
         logger.error(f"Yahoo Finance crypto error for {symbol}: {e}")
+        return None
+
+
+def fetch_goldapi_price(metal: str = "XAU"):
+    """Live spot price for XAU/XAG from goldapi.io — used to correct the
+    'candle close' price (which can lag the real market by a few minutes on
+    free-tier feeds) with an actual current quote."""
+    try:
+        api_key = getattr(config, "GOLDAPI_KEY", "")
+        if not api_key:
+            return None
+        url = f"https://www.goldapi.io/api/{metal}/USD"
+        headers = {"x-access-token": api_key, "Content-Type": "application/json"}
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code != 200:
+            logger.warning(f"GoldAPI HTTP {res.status_code} for {metal}: {res.text[:200]}")
+            return None
+        price = res.json().get("price")
+        return float(price) if price else None
+    except Exception as e:
+        logger.warning(f"GoldAPI fetch error for {metal}: {e}")
         return None
 
 
