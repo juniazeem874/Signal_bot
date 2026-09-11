@@ -2,6 +2,7 @@ import config
 import indicators as ind
 import ai_analyzer
 import news_fetcher
+import data_fetcher
 
 
 async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
@@ -18,6 +19,19 @@ async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
     swing_high, swing_low = ind.find_last_swing(entry_df)
     last_price = entry_df.iloc[-1]["close"]
     latest_atr = entry_df.iloc[-1]["atr"] if "atr" in entry_df.columns else (last_price * 0.001)
+
+    # Candle-close price from TwelveData/Yahoo free-tier feeds can lag the
+    # real market by a few minutes — pull a live spot quote for metals so the
+    # displayed price matches what you'd see on a broker/market chart.
+    symbol_upper = symbol.upper()
+    if symbol_upper in ("XAU/USD", "XAUUSD", "GOLD"):
+        live_price = data_fetcher.fetch_goldapi_price("XAU")
+        if live_price:
+            last_price = live_price
+    elif symbol_upper in ("XAG/USD", "XAGUSD", "SILVER"):
+        live_price = data_fetcher.fetch_goldapi_price("XAG")
+        if live_price:
+            last_price = live_price
 
     exness_buffer = config.EXNESS_SPREAD_BUFFERS.get(symbol, 0.0002)
 
