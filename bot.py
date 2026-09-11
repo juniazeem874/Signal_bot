@@ -229,6 +229,8 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gemini_status = _key_status("GEMINI_API_KEY", getattr(config, "GEMINI_API_KEY", ""))
     twelvedata_status = _key_status("TWELVEDATA_API_KEY", getattr(config, "TWELVEDATA_API_KEY", ""))
     finnhub_status = _key_status("FINNHUB_API_KEY", getattr(config, "FINNHUB_API_KEY", ""))
+    openrouter_status = _key_status("OPENROUTER_API_KEY", getattr(config, "OPENROUTER_API_KEY", ""))
+    goldapi_status = _key_status("GOLDAPI_KEY", getattr(config, "GOLDAPI_KEY", ""))
 
     await update.message.reply_text(
         f"📊 **Bot Status:**\n"
@@ -236,11 +238,13 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Scan Interval: `{SCAN_INTERVAL}s`\n"
         f"Tracked Pairs: `{len(DEFAULT_PAIRS)}`\n\n"
         f"**API Keys:**\n"
-        f"GEMINI_API_KEY: {gemini_status}\n"
+        f"GEMINI_API_KEY: {gemini_status} (primary AI)\n"
+        f"OPENROUTER_API_KEY: {openrouter_status} (AI fallback)\n"
         f"TWELVEDATA_API_KEY: {twelvedata_status}\n"
-        f"FINNHUB_API_KEY: {finnhub_status}\n\n"
-        f"⚠️ If GEMINI_API_KEY is MISSING, every scan silently returns HOLD "
-        f"and no signal is ever sent — this is the #1 cause of \"no auto signals\".",
+        f"FINNHUB_API_KEY: {finnhub_status}\n"
+        f"GOLDAPI_KEY: {goldapi_status} (live gold/silver price)\n\n"
+        f"⚠️ If GEMINI_API_KEY is MISSING and OPENROUTER_API_KEY is also MISSING, "
+        f"every scan silently returns HOLD and no signal is ever sent.",
         parse_mode="Markdown"
     )
 
