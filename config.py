@@ -5,6 +5,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")  # gemini-1.5-flash was retired by Google — always returns 404 now
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")  # used only if Gemini fails entirely
 GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "goldapi-251c13464305698003f71af084a5c3a9-io")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")  # free key from finnhub.io — powers real economic-calendar news
 
