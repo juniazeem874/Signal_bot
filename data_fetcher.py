@@ -139,18 +139,23 @@ def fetch_twelvedata_forex(symbol: str, interval="1min", outputsize=100):
 
 
 def fetch_yfinance_forex(symbol: str, interval="1m", outputsize=100):
-    try:
-        yf_interval = YFINANCE_INTERVAL_MAP.get(interval, "1m")
-        period = "1d" if yf_interval in ["1m", "5m"] else "5d"
+    yf_interval = YFINANCE_INTERVAL_MAP.get(interval, "1m")
+    period = "1d" if yf_interval in ["1m", "5m"] else "5d"
 
-        if symbol.upper() in ["XAU/USD", "XAUUSD", "GOLD"]:
-            tickers_to_try = ["XAUUSD=X", "XAU-USD", "GC=F"]
-        elif "/" in symbol:
-            tickers_to_try = [symbol.replace("/", "") + "=X"]
-        else:
-            tickers_to_try = [symbol + "=X" if not symbol.endswith("=X") else symbol]
+    if symbol.upper() in ["XAU/USD", "XAUUSD", "GOLD"]:
+        tickers_to_try = ["XAUUSD=X", "XAU-USD", "GC=F"]
+    elif symbol.upper() in ["XAG/USD", "XAGUSD", "SILVER"]:
+        # XAGUSD=X and XAG-USD are frequently delisted/empty on Yahoo's free
+        # feed — SI=F (COMMEX silver futures) tracks spot XAG/USD closely and
+        # is far more reliable, so it's included as a same-asset fallback.
+        tickers_to_try = ["XAGUSD=X", "XAG-USD", "SI=F"]
+    elif "/" in symbol:
+        tickers_to_try = [symbol.replace("/", "") + "=X"]
+    else:
+        tickers_to_try = [symbol + "=X" if not symbol.endswith("=X") else symbol]
 
-        for ticker in tickers_to_try:
+    for ticker in tickers_to_try:
+        try:
             df = yf.download(ticker, period=period, interval=yf_interval, progress=False)
             if df is not None and not df.empty:
                 df = df.reset_index()
@@ -178,8 +183,10 @@ def fetch_yfinance_forex(symbol: str, interval="1m", outputsize=100):
                     return df[['time', 'open', 'high', 'low', 'close', 'volume']]
             else:
                 logger.warning(f"Yahoo Finance empty for ticker {ticker} (interval={yf_interval})")
-    except Exception as e:
-        logger.error(f"Yahoo Finance error for {symbol}: {e}")
+        except Exception as e:
+            # A bad/exception-raising ticker shouldn't stop us trying the
+            # remaining fallback tickers in the list (e.g. GC=F / SI=F).
+            logger.error(f"Yahoo Finance error for ticker {ticker}: {e}")
 
     return None
 
