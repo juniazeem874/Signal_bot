@@ -268,6 +268,15 @@ def fetch_tf_data(symbol: str, interval: str):
     if df is None or df.empty:
         df = fetch_yfinance_forex(norm_symbol, interval)
 
+    # Last resort for gold specifically: PAXG is a gold-backed token traded on
+    # Binance/Bybit that tracks spot XAU/USD closely (~0.1-0.5% basis) — far
+    # more reliable uptime than TwelveData's free tier or Yahoo's unofficial API.
+    if (df is None or df.empty) and norm_symbol.upper() in ("XAU/USD", "XAUUSD", "GOLD"):
+        logger.warning("TwelveData + Yahoo failed for gold — trying PAXGUSDT (gold-backed token) as proxy.")
+        df = fetch_binance_crypto("PAXGUSDT", interval)
+        if df is None or df.empty:
+            df = fetch_bybit_crypto("PAXGUSDT", interval)
+
     return df
 
 
