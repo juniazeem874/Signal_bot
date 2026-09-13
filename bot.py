@@ -241,10 +241,9 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     enabled = bot_data.get("auto_trade_enabled", False)
     status_str = "🟢 Active" if enabled else "🔴 Disabled"
 
-    gemini_status = _key_status("GEMINI_API_KEY", getattr(config, "GEMINI_API_KEY", ""))
+    groq_status = _key_status("GROQ_API_KEY", getattr(config, "GROQ_API_KEY", ""))
     twelvedata_status = _key_status("TWELVEDATA_API_KEY", getattr(config, "TWELVEDATA_API_KEY", ""))
     finnhub_status = _key_status("FINNHUB_API_KEY", getattr(config, "FINNHUB_API_KEY", ""))
-    openrouter_status = _key_status("OPENROUTER_API_KEY", getattr(config, "OPENROUTER_API_KEY", ""))
     goldapi_status = _key_status("GOLDAPI_KEY", getattr(config, "GOLDAPI_KEY", ""))
 
     msg = (
@@ -253,13 +252,12 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Scan Interval: {SCAN_INTERVAL}s\n"
         f"Tracked Pairs: {len(DEFAULT_PAIRS)}\n\n"
         f"API Keys:\n"
-        f"`GEMINI_API_KEY`: {gemini_status} (primary AI)\n"
-        f"`OPENROUTER_API_KEY`: {openrouter_status} (AI fallback)\n"
+        f"`GROQ_API_KEY`: {groq_status} (AI analysis)\n"
         f"`TWELVEDATA_API_KEY`: {twelvedata_status}\n"
         f"`FINNHUB_API_KEY`: {finnhub_status}\n"
         f"`GOLDAPI_KEY`: {goldapi_status} (live gold/silver price)\n\n"
-        f"If GEMINI_API_KEY and OPENROUTER_API_KEY are both MISSING, every "
-        f"scan silently returns HOLD and no signal is ever sent."
+        f"If GROQ_API_KEY is MISSING, every scan silently returns HOLD "
+        f"and no signal is ever sent."
     )
     await safe_reply(update, msg)
 
