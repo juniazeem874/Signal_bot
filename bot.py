@@ -91,9 +91,12 @@ async def _delete_prev_nav(context: ContextTypes.DEFAULT_TYPE, chat_id):
 
 
 async def safe_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
-                      reply_markup=None, track_nav: bool = False, auto_delete_hours: float = None):
+                      reply_markup=None, track_nav: bool = False, auto_delete_hours: float = None,
+                      delete_prev_nav: bool = None):
     chat_id = update.effective_chat.id
-    if track_nav:
+    if delete_prev_nav is None:
+        delete_prev_nav = track_nav  # old behavior: track_nav did both
+    if delete_prev_nav:
         await _delete_prev_nav(context, chat_id)
 
     try:
@@ -331,7 +334,7 @@ async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, context, f"🔍 Fetching analysis for `{symbol}`...", track_nav=True)
     msg = await _run_analysis(symbol)
     await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(),
-                      track_nav=True, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
+                      track_nav=False, delete_prev_nav=True, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
 
 
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,7 +375,7 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, context, f"🔍 Analyzing `{symbol}`...", track_nav=True)
         msg = await _run_analysis(symbol)
         await safe_reply(update, context, msg, reply_markup=pair_menu_keyboard(cat_key),
-                          track_nav=True, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
+                          track_nav=False, delete_prev_nav=True, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
         return
 
     # Unrecognized free text — nudge back to the menu instead of staying silent.
