@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -209,6 +210,11 @@ async def _run_analysis(symbol: str) -> str:
         return f"⚠️ Analysis failed for `{symbol}`: {e}\nTry again in a moment."
 
 
+# Rotates which pair leads each scan cycle so one category (crypto) doesn't
+# always claim the Groq per-minute token budget before forex/gold get a turn.
+_SCAN_ROTATION = {"offset": 0}
+
+
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """Runs every SCAN_INTERVAL seconds via the JobQueue and scans all pairs."""
     bot_data = context.application.bot_data
@@ -219,7 +225,19 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
     signals_sent = 0
     pairs_checked = 0
 
-    for symbol in DEFAULT_PAIRS:
+    # Rotate the pair order each cycle (round-robin) and space the Groq calls
+    # out across the scan window — firing all 19 calls in ~15 seconds blows
+    # through Groq's 8000 TPM budget almost immediately, so whichever pairs
+    # are scanned first (crypto) get analyzed and everything after gets 429'd
+    # into a silent HOLD. Spacing them out lets the per-minute budget refill.
+    offset = _SCAN_ROTATION["offset"] % len(DEFAULT_PAIRS)
+    ordered_pairs = DEFAULT_PAIRS[offset:] + DEFAULT_PAIRS[:offset]
+    _SCAN_ROTATION["offset"] = offset + 1
+    per_pair_delay = max(0.5, (SCAN_INTERVAL * 0.85) / max(len(ordered_pairs), 1))
+
+    for i, symbol in enumerate(ordered_pairs):
+        if i > 0:
+            await asyncio.sleep(per_pair_delay)
         try:
             entry_df, trend_df = data_fetcher.get_data(symbol)
             if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
