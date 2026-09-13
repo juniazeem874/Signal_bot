@@ -3,10 +3,8 @@ import os
 # ---- Telegram & API Keys ----
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")  # gemini-1.5-flash was retired by Google — always returns 404 now
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")  # used only if Gemini fails entirely
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")  # Groq retired llama-3.3-70b-versatile on 2026-08-16
 GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "goldapi-251c13464305698003f71af084a5c3a9-io")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")  # free key from finnhub.io — powers real economic-calendar news
 
@@ -19,7 +17,7 @@ CANDLE_LIMIT = 500
 
 # ---- ACCURACY & RISK ACCORDING TO SCALPING ----
 MIN_RISK_REWARD = 1.3         # 1m scalping ke liye realistic TP
-MIN_AI_CONFIDENCE = 70        # Lowered from 85% to 70% so more high-probability trades trigger
+MIN_AI_CONFIDENCE = 65        # Lower = more signals but lower quality; raise back to 70-80 for fewer/stronger-only trades
 ATR_PERIOD = 14
 
 
