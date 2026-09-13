@@ -1,7 +1,7 @@
 import logging
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 import config
 import data_fetcher
@@ -18,11 +18,20 @@ BOT_TOKEN = getattr(config, "TELEGRAM_BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN missing in config.py / environment!")
 
+BRAND = "MJ TRADERS"
+
 CATEGORIES = {
     "crypto": ("💰 Crypto", getattr(config, "CRYPTO_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])),
     "forex": ("💱 Forex", getattr(config, "FOREX_PAIRS", ["EUR/USD", "GBP/USD", "USD/JPY"])),
-    "metals": ("🥇 Metals", getattr(config, "METAL_PAIRS", ["XAU/USD", "XAG/USD"])),
+    "metals": ("🥇 Gold", getattr(config, "METAL_PAIRS", ["XAU/USD", "XAG/USD"])),
 }
+LABEL_TO_CATEGORY = {label: key for key, (label, _pairs) in CATEGORIES.items()}
+ALL_PAIRS_SET = {p for _label, pairs in CATEGORIES.values() for p in pairs}
+
+BACK_LABEL = "⬅️ Back"
+STATUS_LABEL = "📊 Status"
+AUTO_ON_LABEL = "🟢 Auto ON"
+AUTO_OFF_LABEL = "🔴 Auto OFF"
 
 DEFAULT_PAIRS = getattr(config, "AUTO_SCAN_PAIRS", ["BTCUSDT", "XAU/USD", "EUR/USD", "GBP/USD", "USD/JPY"])
 SCAN_INTERVAL = getattr(config, "AUTO_SCAN_INTERVAL", 60)
@@ -51,14 +60,6 @@ async def safe_reply(update: Update, text: str, reply_markup=None):
         await update.message.reply_text(_strip_markdown(text), reply_markup=reply_markup)
 
 
-async def safe_edit(query, text: str, reply_markup=None):
-    try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Markdown edit failed, retrying as plain text: {e}")
-        await query.edit_message_text(_strip_markdown(text), reply_markup=reply_markup)
-
-
 async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str):
     try:
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
@@ -70,6 +71,40 @@ async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str):
             logger.error(f"Plain-text send to {chat_id} also failed: {e2}")
 
 
+# ==================== APP-STYLE BOTTOM MENU (persistent keyboard) ====================
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    bot_data_auto = _AUTO_STATE.get("enabled", True)
+    auto_row = [AUTO_OFF_LABEL if bot_data_auto else AUTO_ON_LABEL]
+    return ReplyKeyboardMarkup(
+        [
+            [CATEGORIES["crypto"][0], CATEGORIES["forex"][0], CATEGORIES["metals"][0]],
+            [STATUS_LABEL] + auto_row,
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def pair_menu_keyboard(cat_key: str) -> ReplyKeyboardMarkup:
+    _label, pairs = CATEGORIES[cat_key]
+    rows = [pairs[i:i + 2] for i in range(0, len(pairs), 2)]
+    rows.append([BACK_LABEL])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+# Tracks auto-trade state for rendering the keyboard label — the real
+# source of truth is application.bot_data["auto_trade_enabled"].
+_AUTO_STATE = {"enabled": True}
+
+
+def _category_of(symbol: str) -> str:
+    for key, (_label, pairs) in CATEGORIES.items():
+        if symbol in pairs:
+            return key
+    return "crypto"
+
+
 def _format_signal_message(symbol: str, result: dict, header: str) -> str:
     signal = result.get("signal", "HOLD")
     icon = "🟢" if signal == "BUY" else ("🔴" if signal == "SELL" else "⏸️")
@@ -77,7 +112,7 @@ def _format_signal_message(symbol: str, result: dict, header: str) -> str:
     reasons_str = "\n".join(f"• {r}" for r in reasons) if reasons else "Strategy conditions met"
 
     lines = [
-        f"{icon} **{header}** {icon}",
+        f"{icon} **{BRAND} — {header}** {icon}",
         "",
         f"**Pair:** `{symbol}`",
         f"**Action:** `{signal}`",
@@ -97,11 +132,11 @@ def _format_signal_message(symbol: str, result: dict, header: str) -> str:
 
 
 async def _run_analysis(symbol: str) -> str:
-    """Shared by /signal and the pair-picker buttons — fetches data, runs the
+    """Shared by /signal and the pair buttons — fetches data, runs the
     strategy, and returns a fully formatted BUY/SELL/HOLD message with reasons."""
     entry_df, trend_df = data_fetcher.get_data(symbol)
     if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
-        return f"❌ Market data empty for `{symbol}` — try again in a bit, or check /status."
+        return f"❌ Market data empty for `{symbol}` — try again in a bit, or check Status."
 
     result = await strategy.analyze(entry_df, trend_df, symbol)
     return _format_signal_message(symbol, result, "SIGNAL RESULT")
@@ -136,7 +171,7 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
             LAST_SIGNALS[symbol] = signal_key
 
-            msg = _format_signal_message(symbol, result, "AUTOMATED TRADE SIGNAL")
+            msg = _format_signal_message(symbol, result, "AUTO SIGNAL")
             for chat_id in list(bot_data["active_chat_ids"]):
                 await safe_send(context, chat_id, msg)
             signals_sent += 1
@@ -147,89 +182,23 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Scan cycle done: {pairs_checked}/{len(DEFAULT_PAIRS)} pairs had data, {signals_sent} signal(s) sent.")
 
 
-# ==================== INLINE MENU (category -> pair -> analysis) ====================
-
-def _category_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(label, callback_data=f"cat:{key}")]
-        for key, (label, _pairs) in CATEGORIES.items()
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-def _pair_keyboard(cat_key: str) -> InlineKeyboardMarkup:
-    _label, pairs = CATEGORIES[cat_key]
-    # 2 pairs per row so the list stays compact on mobile.
-    rows = []
-    for i in range(0, len(pairs), 2):
-        row = [InlineKeyboardButton(p, callback_data=f"pair:{p}") for p in pairs[i:i + 2]]
-        rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back:menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "back:menu":
-        await safe_edit(query, "🤖 **Trading Signal Bot**\n\nChoose a category:", reply_markup=_category_keyboard())
-        return
-
-    if data.startswith("cat:"):
-        cat_key = data.split(":", 1)[1]
-        if cat_key not in CATEGORIES:
-            return
-        label, _pairs = CATEGORIES[cat_key]
-        await safe_edit(query, f"{label} — pick a pair for instant analysis:", reply_markup=_pair_keyboard(cat_key))
-        return
-
-    if data.startswith("pair:"):
-        symbol = data.split(":", 1)[1]
-        await safe_edit(query, f"🔍 Analyzing `{symbol}`...")
-        msg = await _run_analysis(symbol)
-        await safe_edit(query, msg, reply_markup=_pair_keyboard(_category_of(symbol)))
-
-
-def _category_of(symbol: str) -> str:
-    for key, (_label, pairs) in CATEGORIES.items():
-        if symbol in pairs:
-            return key
-    return "crypto"
-
-
-# ==================== TELEGRAM COMMAND HANDLERS ====================
+# ==================== TELEGRAM HANDLERS ====================
 
 async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_data = context.application.bot_data
     bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
-    # Auto-trade turns on as soon as someone starts the bot.
     bot_data["auto_trade_enabled"] = True
+    _AUTO_STATE["enabled"] = True
 
     welcome_msg = (
-        "🤖 **Trading Signal Bot Active**\n\n"
-        f"Auto-scanning every `{SCAN_INTERVAL}s` across "
-        f"`{len(DEFAULT_PAIRS)}` pairs — you'll get BUY/SELL alerts automatically.\n\n"
-        "👇 Tap a category, then a pair, for an instant BUY/SELL/HOLD analysis with reasons.\n\n"
-        "Commands:\n"
-        "• /autoon /autooff - auto signals on/off\n"
-        "• /signal [PAIR] - instant manual check (e.g. /signal BTCUSDT)\n"
-        "• /status - bot status"
+        f"🤖 **{BRAND}**\n"
+        f"Trading Signal Bot\n\n"
+        f"Auto-scanning every `{SCAN_INTERVAL}s` across `{len(DEFAULT_PAIRS)}` pairs — "
+        f"you'll get BUY/SELL alerts automatically.\n\n"
+        "👇 Neeche menu se category chunein, phir pair pe tap karein — "
+        "turant BUY/SELL/HOLD analysis reasons ke saath milega."
     )
-    await safe_reply(update, welcome_msg, reply_markup=_category_keyboard())
-
-
-async def enable_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_data = context.application.bot_data
-    bot_data["auto_trade_enabled"] = True
-    bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
-    await safe_reply(update, "✅ **Auto-Trade Mode Activated!**\nBot ab background mein market scan karke alerts bheje ga.")
-
-
-async def disable_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.application.bot_data["auto_trade_enabled"] = False
-    await safe_reply(update, "🛑 **Auto-Trade Mode Deactivated.**")
+    await safe_reply(update, welcome_msg, reply_markup=main_menu_keyboard())
 
 
 def _key_status(name: str, value: str) -> str:
@@ -247,7 +216,7 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     goldapi_status = _key_status("GOLDAPI_KEY", getattr(config, "GOLDAPI_KEY", ""))
 
     msg = (
-        f"📊 Bot Status:\n"
+        f"📊 {BRAND} — Bot Status:\n"
         f"Auto-Trade: {status_str}\n"
         f"Scan Interval: {SCAN_INTERVAL}s\n"
         f"Tracked Pairs: {len(DEFAULT_PAIRS)}\n\n"
@@ -259,19 +228,60 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"If GROQ_API_KEY is MISSING, every scan silently returns HOLD "
         f"and no signal is ever sent."
     )
-    await safe_reply(update, msg)
+    await safe_reply(update, msg, reply_markup=main_menu_keyboard())
 
 
 async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Single pair ka instant signal check karta hai."""
+    """/signal [PAIR] — instant manual check."""
     symbol = context.args[0].upper() if context.args else "BTCUSDT"
     await safe_reply(update, f"🔍 Fetching analysis for `{symbol}`...")
     try:
         msg = await _run_analysis(symbol)
-        await safe_reply(update, msg)
+        await safe_reply(update, msg, reply_markup=main_menu_keyboard())
     except Exception as e:
         logger.error(f"Manual signal error for {symbol}: {e}")
         await safe_reply(update, f"⚠️ Error: {e}")
+
+
+async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on the persistent bottom menu (ReplyKeyboardMarkup)."""
+    text = (update.message.text or "").strip()
+    bot_data = context.application.bot_data
+    bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
+
+    if text == BACK_LABEL:
+        await safe_reply(update, f"🤖 {BRAND} — choose a category:", reply_markup=main_menu_keyboard())
+        return
+
+    if text == STATUS_LABEL:
+        await check_status(update, context)
+        return
+
+    if text in (AUTO_ON_LABEL, AUTO_OFF_LABEL):
+        turning_on = text == AUTO_ON_LABEL
+        bot_data["auto_trade_enabled"] = turning_on
+        _AUTO_STATE["enabled"] = turning_on
+        msg = "✅ **Auto-Trade Activated!**" if turning_on else "🛑 **Auto-Trade Deactivated.**"
+        await safe_reply(update, msg, reply_markup=main_menu_keyboard())
+        return
+
+    if text in LABEL_TO_CATEGORY:
+        cat_key = LABEL_TO_CATEGORY[text]
+        label, _pairs = CATEGORIES[cat_key]
+        await safe_reply(update, f"{label} — pick a pair for instant analysis:", reply_markup=pair_menu_keyboard(cat_key))
+        return
+
+    symbol = text.upper()
+    if symbol in ALL_PAIRS_SET or text in ALL_PAIRS_SET:
+        symbol = symbol if symbol in ALL_PAIRS_SET else text
+        cat_key = _category_of(symbol)
+        await safe_reply(update, f"🔍 Analyzing `{symbol}`...")
+        msg = await _run_analysis(symbol)
+        await safe_reply(update, msg, reply_markup=pair_menu_keyboard(cat_key))
+        return
+
+    # Unrecognized free text — nudge back to the menu instead of staying silent.
+    await safe_reply(update, "Neeche menu se koi option chunein 👇", reply_markup=main_menu_keyboard())
 
 
 # ==================== APP BUILDER ====================
@@ -281,13 +291,12 @@ def build_app() -> Application:
 
     app.bot_data["active_chat_ids"] = set()
     app.bot_data["auto_trade_enabled"] = getattr(config, "AUTO_SCAN_ENABLED", False)
+    _AUTO_STATE["enabled"] = app.bot_data["auto_trade_enabled"]
 
     app.add_handler(CommandHandler(["start", "help"], send_welcome))
-    app.add_handler(CommandHandler("autoon", enable_autotrade))
-    app.add_handler(CommandHandler("autooff", disable_autotrade))
     app.add_handler(CommandHandler("status", check_status))
     app.add_handler(CommandHandler("signal", manual_signal))
-    app.add_handler(CallbackQueryHandler(menu_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_text))
 
     # Runs auto_scan_job every SCAN_INTERVAL seconds in the background.
     app.job_queue.run_repeating(auto_scan_job, interval=SCAN_INTERVAL, first=10)
