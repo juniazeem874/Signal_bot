@@ -8,8 +8,9 @@ logger = logging.getLogger(__name__)
 
 
 def _build_prompt(symbol: str, market_summary: dict) -> str:
+    news = market_summary.get('news_data', {}) or {}
     return f"""
-    You are an Active Institutional Exness Scalper. Your job is to find active BUY or SELL scalping trades on 1m timeframe using 15m HTF alignment.
+    You are an Active Institutional Exness Scalper. Your job is to find active BUY or SELL scalping trades on 1m timeframe using 15m HTF alignment. You must weigh BOTH the technical setup AND the news/economic-calendar status below — do not ignore the news section.
 
     --- MARKET DATA ---
     - Pair: {symbol}
@@ -21,17 +22,18 @@ def _build_prompt(symbol: str, market_summary: dict) -> str:
     - Exness Spread Buffer: {market_summary.get('exness_buffer')}
 
     --- NEWS / ECONOMIC CALENDAR ---
-    - Currency: {market_summary.get('news_data', {}).get('currency')}
-    - Status: {market_summary.get('news_data', {}).get('news_status')}
-    - Upcoming High-Impact Events: {market_summary.get('news_data', {}).get('upcoming_events')}
+    - Currency: {news.get('currency')}
+    - Status: {news.get('news_status')}
+    - Upcoming High-Impact Events: {news.get('upcoming_events')}
 
     --- SCALPING EXECUTION RULES ---
     1. If 15m HTF Trend is BULLISH and 1m price is creating higher lows / rejection candles, generate "BUY".
     2. If 15m HTF Trend is BEARISH and 1m price is creating lower highs / rejection candles, generate "SELL".
     3. Do NOT stay in HOLD if there is a clear directional push or pattern alignment with 15m trend.
-    4. If a high-impact news event is imminent for this pair's currency, lower confidence or prefer HOLD — news volatility can invalidate technical setups.
+    4. If a high-impact news event is imminent for this pair's currency, lower confidence or prefer HOLD — news volatility can invalidate technical setups. If there is no high-impact news pending, say so explicitly as a positive factor.
     5. Include Exness spread buffer ({market_summary.get('exness_buffer')}) in Stop Loss calculation.
-    6. Set Confidence between 70% to 95% based on setup quality, adjusted down if high-impact news is pending.
+    6. Set Confidence between 60% to 95% based on setup quality, adjusted down if high-impact news is pending.
+    7. "reasons" MUST contain exactly 3 short items: [0] the core technical setup reason, [1] the Exness execution/risk logic, [2] an explicit statement of how the news/economic-calendar status above factored into this decision (even if the answer is "no high-impact news, so no adjustment made").
 
     Return ONLY valid raw JSON format, no markdown fences, no commentary:
     {{
@@ -41,7 +43,8 @@ def _build_prompt(symbol: str, market_summary: dict) -> str:
       "take_profit": number,
       "reasons": [
         "Core technical setup reason",
-        "Exness execution & risk logic"
+        "Exness execution & risk logic",
+        "News/economic-calendar factor"
       ]
     }}
     """
@@ -57,123 +60,80 @@ def _parse_ai_json(raw_text: str) -> dict:
 
 
 def _apply_confidence_gate(parsed: dict) -> dict:
-    min_conf = getattr(config, "MIN_AI_CONFIDENCE", 70)
+    min_conf = getattr(config, "MIN_AI_CONFIDENCE", 65)
     if parsed.get("confidence", 0) < min_conf:
         parsed["signal"] = "HOLD"
         parsed["reasons"] = [f"Confidence ({parsed.get('confidence')}%) below active threshold ({min_conf}%)."]
     return parsed
 
 
-# ==================== GEMINI (primary) ====================
+# ==================== GROQ (sole AI provider) ====================
+# Groq retires/renames models periodically (e.g. llama-3.3-70b-versatile was
+# decommissioned 2026-08-16) — trying a short fallback list here means the
+# bot doesn't go silent again the way it did when gemini-1.5-flash died.
+GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
 
-def _fetch_gemini_response(url: str, payload: dict, headers: dict):
+
+def _fetch_groq_response(payload: dict, headers: dict):
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=12)
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json=payload, headers=headers, timeout=15
+        )
         if response.status_code == 200:
             return response.json(), response.status_code
-        logger.error(f"Gemini API Error {response.status_code}: {response.text[:300]}")
+        logger.error(f"Groq API Error {response.status_code}: {response.text[:300]}")
         return None, response.status_code
     except Exception as e:
-        logger.error(f"Gemini Request Failed: {e}")
+        logger.error(f"Groq Request Failed: {e}")
         return None, None
 
 
-# If the primary model gets retired again in the future, these are tried in
-# order so the bot doesn't go silent the way it did with gemini-1.5-flash.
-GEMINI_MODEL_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-2.5-flash"]
-
-
-async def _call_gemini(symbol: str, prompt: str) -> dict:
-    api_key = getattr(config, "GEMINI_API_KEY", "")
+async def _call_groq(symbol: str, prompt: str) -> dict:
+    api_key = getattr(config, "GROQ_API_KEY", "")
     if not api_key:
-        logger.warning("GEMINI_API_KEY not set — skipping Gemini.")
+        logger.error(
+            "GROQ_API_KEY is not set — every signal will silently come back HOLD. "
+            "Set GROQ_API_KEY in Railway's Environment tab and redeploy."
+        )
         return None
 
-    primary_model = getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
-    models_to_try = [primary_model] + [m for m in GEMINI_MODEL_FALLBACKS if m != primary_model]
-
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    headers = {"Content-Type": "application/json"}
+    primary_model = getattr(config, "GROQ_MODEL", "openai/gpt-oss-120b")
+    models_to_try = [primary_model] + [m for m in GROQ_MODEL_FALLBACKS if m != primary_model]
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     try:
         res_data = None
         for model_name in models_to_try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-            res_data, status_code = await asyncio.to_thread(_fetch_gemini_response, url, payload, headers)
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            }
+            res_data, status_code = await asyncio.to_thread(_fetch_groq_response, payload, headers)
             if res_data:
                 if model_name != primary_model:
-                    logger.warning(f"Primary Gemini model '{primary_model}' failed — used fallback '{model_name}' instead.")
+                    logger.warning(f"Primary Groq model '{primary_model}' failed — used fallback '{model_name}' instead.")
                 break
-            if status_code == 404:
-                logger.warning(f"Gemini model '{model_name}' not found/retired — trying next fallback.")
+            if status_code in (400, 404):
+                # 400 on Groq is what a decommissioned/unknown model_id returns.
+                logger.warning(f"Groq model '{model_name}' unavailable/retired — trying next fallback.")
                 continue
-            break  # non-404 error won't be fixed by switching models
+            break  # other errors (auth/quota/network) won't be fixed by switching models
 
-        if not res_data:
-            return None
-
-        raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
-        return _apply_confidence_gate(_parse_ai_json(raw_text))
-    except Exception as e:
-        logger.error(f"Gemini processing exception for {symbol}: {e}")
-        return None
-
-
-# ==================== OPENROUTER (fallback if Gemini fails entirely) ====================
-
-def _fetch_openrouter_response(payload: dict, headers: dict):
-    try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            json=payload, headers=headers, timeout=15
-        )
-        if response.status_code == 200:
-            return response.json()
-        logger.error(f"OpenRouter API Error {response.status_code}: {response.text[:300]}")
-    except Exception as e:
-        logger.error(f"OpenRouter Request Failed: {e}")
-    return None
-
-
-async def _call_openrouter(symbol: str, prompt: str) -> dict:
-    api_key = getattr(config, "OPENROUTER_API_KEY", "")
-    if not api_key:
-        logger.warning("OPENROUTER_API_KEY not set — no fallback AI available, Gemini failure means HOLD.")
-        return None
-
-    model = getattr(config, "OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        res_data = await asyncio.to_thread(_fetch_openrouter_response, payload, headers)
         if not res_data:
             return None
 
         raw_text = res_data["choices"][0]["message"]["content"]
-        parsed = _apply_confidence_gate(_parse_ai_json(raw_text))
-        logger.warning(f"Gemini unavailable for {symbol} — used OpenRouter fallback ({model}) instead.")
-        return parsed
+        return _apply_confidence_gate(_parse_ai_json(raw_text))
     except Exception as e:
-        logger.error(f"OpenRouter processing exception for {symbol}: {e}")
+        logger.error(f"Groq processing exception for {symbol}: {e}")
         return None
 
 
 # ==================== PUBLIC ENTRY POINT ====================
 
 async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
-    """Tries Gemini first (with its own model-fallback chain). Only if Gemini
-    fails entirely does it fall back to the free OpenRouter model."""
     prompt = _build_prompt(symbol, market_summary)
-
-    result = await _call_gemini(symbol, prompt)
-    if result:
-        return result
-
-    return await _call_openrouter(symbol, prompt)
+    return await _call_groq(symbol, prompt)
