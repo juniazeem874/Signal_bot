@@ -1,4 +1,5 @@
 import logging
+import time
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -19,7 +20,8 @@ if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN missing in config.py / environment!")
 
 BRAND = "MJ TRADERS"
-SIGNAL_AUTO_DELETE_HOURS = 4  # trade signals older than this get auto-removed from the chat
+SIGNAL_AUTO_DELETE_HOURS = 6  # trade signals older than this get auto-removed from the chat
+SIGNAL_COOLDOWN_SECONDS = 6 * 60 * 60  # don't re-fire an auto signal for the same pair within this window
 
 CATEGORIES = {
     "crypto": ("💰 Crypto", getattr(config, "CRYPTO_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])),
@@ -39,6 +41,8 @@ SCAN_INTERVAL = getattr(config, "AUTO_SCAN_INTERVAL", 60)
 
 # Duplicate-signal guard: {symbol: "SIGNAL_time"}
 LAST_SIGNALS = {}
+# Wall-clock cooldown guard: {symbol: unix_timestamp_last_sent}
+LAST_SIGNAL_SENT_AT = {}
 
 # Tracks auto-trade state for rendering the keyboard label — the real
 # source of truth is application.bot_data["auto_trade_enabled"].
@@ -212,11 +216,17 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
             if signal == "HOLD":
                 continue
 
+            now_ts = time.time()
+            last_sent_ts = LAST_SIGNAL_SENT_AT.get(symbol)
+            if last_sent_ts and (now_ts - last_sent_ts) < SIGNAL_COOLDOWN_SECONDS:
+                continue  # still inside this pair's 6-hour cooldown
+
             current_time_str = str(entry_df['time'].iloc[-1])
             signal_key = f"{symbol}_{signal}_{current_time_str}"
             if LAST_SIGNALS.get(symbol) == signal_key:
                 continue
             LAST_SIGNALS[symbol] = signal_key
+            LAST_SIGNAL_SENT_AT[symbol] = now_ts
 
             msg = _format_signal_message(symbol, result, "AUTO SIGNAL")
             for chat_id in list(bot_data["active_chat_ids"]):
