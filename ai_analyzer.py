@@ -1,4 +1,6 @@
+import json
 import requests
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
@@ -101,3 +103,135 @@ def get_economic_news(symbol: str) -> dict:
             "news_status": "News feed unavailable (exception)",
             "upcoming_events": "Unknown"
         }
+
+
+def _build_prompt(symbol: str, market_summary: dict) -> str:
+    news = market_summary.get('news_data', {}) or {}
+    return f"""
+    You are an Active Institutional Exness Scalper. Your job is to find active BUY or SELL scalping trades on 1m timeframe using 15m HTF alignment. You must weigh BOTH the technical setup AND the news/economic-calendar status below — do not ignore the news section.
+
+    --- MARKET DATA ---
+    - Pair: {symbol}
+    - Live Price: {market_summary.get('last_price')}
+    - 15m HTF Trend: {market_summary.get('htf_bias')}
+    - Price Patterns / Rejections: {market_summary.get('patterns')}
+    - Swing High: {market_summary.get('swing_high')} | Swing Low: {market_summary.get('swing_low')}
+    - ATR Volatility: {market_summary.get('atr')}
+    - Exness Spread Buffer: {market_summary.get('exness_buffer')}
+
+    --- NEWS / ECONOMIC CALENDAR ---
+    - Currency: {news.get('currency')}
+    - Status: {news.get('news_status')}
+    - Upcoming High-Impact Events: {news.get('upcoming_events')}
+
+    --- SCALPING EXECUTION RULES ---
+    1. If 15m HTF Trend is BULLISH and 1m price is creating higher lows / rejection candles, generate "BUY".
+    2. If 15m HTF Trend is BEARISH and 1m price is creating lower highs / rejection candles, generate "SELL".
+    3. Do NOT stay in HOLD if there is a clear directional push or pattern alignment with 15m trend.
+    4. If a high-impact news event is imminent for this pair's currency, lower confidence or prefer HOLD — news volatility can invalidate technical setups. If there is no high-impact news pending, say so explicitly as a positive factor.
+    5. Include Exness spread buffer ({market_summary.get('exness_buffer')}) in Stop Loss calculation.
+    6. Set Confidence between 60% to 95% based on setup quality, adjusted down if high-impact news is pending.
+    7. "reasons" MUST contain exactly 3 short items: [0] the core technical setup reason, [1] the Exness execution/risk logic, [2] an explicit statement of how the news/economic-calendar status above factored into this decision (even if the answer is "no high-impact news, so no adjustment made").
+
+    Return ONLY valid raw JSON format, no markdown fences, no commentary:
+    {{
+      "signal": "BUY" | "SELL" | "HOLD",
+      "confidence": number,
+      "stop_loss": number,
+      "take_profit": number,
+      "reasons": [
+        "Core technical setup reason",
+        "Exness execution & risk logic",
+        "News/economic-calendar factor"
+      ]
+    }}
+    """
+
+
+def _parse_ai_json(raw_text: str) -> dict:
+    raw_text = raw_text.strip()
+    if raw_text.startswith("```json"):
+        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+    elif raw_text.startswith("```"):
+        raw_text = raw_text.replace("```", "").strip()
+    return json.loads(raw_text)
+
+
+def _apply_confidence_gate(parsed: dict) -> dict:
+    min_conf = getattr(config, "MIN_AI_CONFIDENCE", 65)
+    if parsed.get("confidence", 0) < min_conf:
+        parsed["signal"] = "HOLD"
+        parsed["reasons"] = [f"Confidence ({parsed.get('confidence')}%) below active threshold ({min_conf}%)."]
+    return parsed
+
+
+# ==================== GROQ (sole AI provider) ====================
+# Groq retires/renames models periodically (e.g. llama-3.3-70b-versatile was
+# decommissioned 2026-08-16) — trying a short fallback list here means the
+# bot doesn't go silent again the way it did when gemini-1.5-flash died.
+GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
+
+
+def _fetch_groq_response(payload: dict, headers: dict):
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json=payload, headers=headers, timeout=15
+        )
+        if response.status_code == 200:
+            return response.json(), response.status_code
+        logger.error(f"Groq API Error {response.status_code}: {response.text[:300]}")
+        return None, response.status_code
+    except Exception as e:
+        logger.error(f"Groq Request Failed: {e}")
+        return None, None
+
+
+async def _call_groq(symbol: str, prompt: str) -> dict:
+    api_key = getattr(config, "GROQ_API_KEY", "")
+    if not api_key:
+        logger.error(
+            "GROQ_API_KEY is not set — every signal will silently come back HOLD. "
+            "Set GROQ_API_KEY in Railway's Environment tab and redeploy."
+        )
+        return None
+
+    primary_model = getattr(config, "GROQ_MODEL", "openai/gpt-oss-120b")
+    models_to_try = [primary_model] + [m for m in GROQ_MODEL_FALLBACKS if m != primary_model]
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    try:
+        res_data = None
+        for model_name in models_to_try:
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            }
+            res_data, status_code = await asyncio.to_thread(_fetch_groq_response, payload, headers)
+            if res_data:
+                if model_name != primary_model:
+                    logger.warning(f"Primary Groq model '{primary_model}' failed — used fallback '{model_name}' instead.")
+                break
+            if status_code in (400, 404):
+                # 400 on Groq is what a decommissioned/unknown model_id returns.
+                logger.warning(f"Groq model '{model_name}' unavailable/retired — trying next fallback.")
+                continue
+            break  # other errors (auth/quota/network) won't be fixed by switching models
+
+        if not res_data:
+            return None
+
+        raw_text = res_data["choices"][0]["message"]["content"]
+        return _apply_confidence_gate(_parse_ai_json(raw_text))
+    except Exception as e:
+        logger.error(f"Groq processing exception for {symbol}: {e}")
+        return None
+
+
+# ==================== PUBLIC ENTRY POINT ====================
+
+async def analyze_market_with_ai(symbol: str, market_summary: dict) -> dict:
+    prompt = _build_prompt(symbol, market_summary)
+    return await _call_groq(symbol, prompt)
