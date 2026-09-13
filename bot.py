@@ -122,6 +122,22 @@ async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str, auto
         _schedule_auto_delete(context, chat_id, sent.message_id, auto_delete_hours)
 
 
+async def _delete_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes the user's own message (a command or a menu-button tap) right
+    after it's received, so taps like /start, Crypto, BTCUSDT, Back, Status
+    don't stay visible on the right side of the chat. Telegram lets a bot
+    delete any message (its own or the other party's) in a private chat
+    within 48 hours — if that fails for any reason (older chat, permissions,
+    group chat) we just leave the message in place instead of crashing."""
+    msg = update.message
+    if not msg:
+        return
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+    except Exception as e:
+        logger.debug(f"Couldn't delete incoming message {msg.message_id}: {e}")
+
+
 # ==================== APP-STYLE BOTTOM MENU (persistent keyboard) ====================
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -242,6 +258,7 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
 # ==================== TELEGRAM HANDLERS ====================
 
 async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_incoming(update, context)
     bot_data = context.application.bot_data
     bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
     bot_data["auto_trade_enabled"] = True
@@ -263,6 +280,7 @@ def _key_status(name: str, value: str) -> str:
 
 
 async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_incoming(update, context)
     bot_data = context.application.bot_data
     enabled = bot_data.get("auto_trade_enabled", False)
     status_str = "🟢 Active" if enabled else "🔴 Disabled"
@@ -290,6 +308,7 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/signal [PAIR] — instant manual check."""
+    await _delete_incoming(update, context)
     symbol = context.args[0].upper() if context.args else "BTCUSDT"
     await safe_reply(update, context, f"🔍 Fetching analysis for `{symbol}`...", track_nav=True)
     msg = await _run_analysis(symbol)
@@ -300,6 +319,7 @@ async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles taps on the persistent bottom menu (ReplyKeyboardMarkup)."""
     text = (update.message.text or "").strip()
+    await _delete_incoming(update, context)
     bot_data = context.application.bot_data
     bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
 
