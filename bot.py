@@ -19,6 +19,7 @@ if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN missing in config.py / environment!")
 
 BRAND = "MJ TRADERS"
+SIGNAL_AUTO_DELETE_HOURS = 4  # trade signals older than this get auto-removed from the chat
 
 CATEGORIES = {
     "crypto": ("💰 Crypto", getattr(config, "CRYPTO_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])),
@@ -39,12 +40,18 @@ SCAN_INTERVAL = getattr(config, "AUTO_SCAN_INTERVAL", 60)
 # Duplicate-signal guard: {symbol: "SIGNAL_time"}
 LAST_SIGNALS = {}
 
+# Tracks auto-trade state for rendering the keyboard label — the real
+# source of truth is application.bot_data["auto_trade_enabled"].
+_AUTO_STATE = {"enabled": True}
 
-# ==================== MARKDOWN-SAFE SEND HELPERS ====================
-# AI-generated "reasons" text (and key names with underscores) can contain
-# characters Telegram's legacy Markdown parser chokes on (stray _ * [ ]),
-# which makes send_message/reply_text raise and the handler go silent.
-# These helpers retry as plain text instead of failing silently.
+
+# ==================== SEND HELPERS (Markdown-safe, single-screen, auto-delete) ====================
+# 1. AI-generated "reasons" text (and key names with underscores) can contain
+#    characters Telegram's legacy Markdown parser chokes on — these helpers
+#    retry as plain text instead of failing/hanging silently.
+# 2. "App style" single screen: navigating (category/back/analysis) deletes
+#    the previous menu message so the chat doesn't fill up with old screens.
+# 3. Trade signals auto-delete after SIGNAL_AUTO_DELETE_HOURS.
 
 def _strip_markdown(text: str) -> str:
     for ch in ("**", "`", "_", "*"):
@@ -52,30 +59,69 @@ def _strip_markdown(text: str) -> str:
     return text
 
 
-async def safe_reply(update: Update, text: str, reply_markup=None):
+async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
     try:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+    except Exception as e:
+        logger.warning(f"Could not auto-delete message {data.get('message_id')}: {e}")
+
+
+def _schedule_auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id, hours: float):
+    context.application.job_queue.run_once(
+        _delete_message_job,
+        when=hours * 3600,
+        data={"chat_id": chat_id, "message_id": message_id},
+    )
+
+
+async def _delete_prev_nav(context: ContextTypes.DEFAULT_TYPE, chat_id):
+    nav_map = context.application.bot_data.setdefault("nav_msg", {})
+    prev_id = nav_map.get(chat_id)
+    if prev_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=prev_id)
+        except Exception:
+            pass  # already gone / too old — fine to ignore
+
+
+async def safe_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
+                      reply_markup=None, track_nav: bool = False, auto_delete_hours: float = None):
+    chat_id = update.effective_chat.id
+    if track_nav:
+        await _delete_prev_nav(context, chat_id)
+
+    try:
+        sent = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Markdown reply failed, retrying as plain text: {e}")
-        await update.message.reply_text(_strip_markdown(text), reply_markup=reply_markup)
+        sent = await update.message.reply_text(_strip_markdown(text), reply_markup=reply_markup)
+
+    if track_nav:
+        context.application.bot_data.setdefault("nav_msg", {})[chat_id] = sent.message_id
+    if auto_delete_hours:
+        _schedule_auto_delete(context, chat_id, sent.message_id, auto_delete_hours)
+    return sent
 
 
-async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str):
+async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str, auto_delete_hours: float = None):
+    sent = None
     try:
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Markdown send to {chat_id} failed, retrying as plain text: {e}")
         try:
-            await context.bot.send_message(chat_id=chat_id, text=_strip_markdown(text))
+            sent = await context.bot.send_message(chat_id=chat_id, text=_strip_markdown(text))
         except Exception as e2:
             logger.error(f"Plain-text send to {chat_id} also failed: {e2}")
+    if sent and auto_delete_hours:
+        _schedule_auto_delete(context, chat_id, sent.message_id, auto_delete_hours)
 
 
 # ==================== APP-STYLE BOTTOM MENU (persistent keyboard) ====================
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    bot_data_auto = _AUTO_STATE.get("enabled", True)
-    auto_row = [AUTO_OFF_LABEL if bot_data_auto else AUTO_ON_LABEL]
+    auto_row = [AUTO_OFF_LABEL if _AUTO_STATE.get("enabled", True) else AUTO_ON_LABEL]
     return ReplyKeyboardMarkup(
         [
             [CATEGORIES["crypto"][0], CATEGORIES["forex"][0], CATEGORIES["metals"][0]],
@@ -91,11 +137,6 @@ def pair_menu_keyboard(cat_key: str) -> ReplyKeyboardMarkup:
     rows = [pairs[i:i + 2] for i in range(0, len(pairs), 2)]
     rows.append([BACK_LABEL])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
-
-
-# Tracks auto-trade state for rendering the keyboard label — the real
-# source of truth is application.bot_data["auto_trade_enabled"].
-_AUTO_STATE = {"enabled": True}
 
 
 def _category_of(symbol: str) -> str:
@@ -133,13 +174,19 @@ def _format_signal_message(symbol: str, result: dict, header: str) -> str:
 
 async def _run_analysis(symbol: str) -> str:
     """Shared by /signal and the pair buttons — fetches data, runs the
-    strategy, and returns a fully formatted BUY/SELL/HOLD message with reasons."""
-    entry_df, trend_df = data_fetcher.get_data(symbol)
-    if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
-        return f"❌ Market data empty for `{symbol}` — try again in a bit, or check Status."
+    strategy, and returns a fully formatted BUY/SELL/HOLD message with reasons.
+    Never raises — any failure becomes a user-visible error message instead of
+    leaving the chat stuck on 'Analyzing...' forever."""
+    try:
+        entry_df, trend_df = data_fetcher.get_data(symbol)
+        if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
+            return f"❌ Market data empty for `{symbol}` — try again in a bit, or check Status."
 
-    result = await strategy.analyze(entry_df, trend_df, symbol)
-    return _format_signal_message(symbol, result, "SIGNAL RESULT")
+        result = await strategy.analyze(entry_df, trend_df, symbol)
+        return _format_signal_message(symbol, result, "SIGNAL RESULT")
+    except Exception as e:
+        logger.error(f"_run_analysis crashed for {symbol}: {e}", exc_info=True)
+        return f"⚠️ Analysis failed for `{symbol}`: {e}\nTry again in a moment."
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -173,7 +220,7 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
             msg = _format_signal_message(symbol, result, "AUTO SIGNAL")
             for chat_id in list(bot_data["active_chat_ids"]):
-                await safe_send(context, chat_id, msg)
+                await safe_send(context, chat_id, msg, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
             signals_sent += 1
 
         except Exception as pair_err:
@@ -198,7 +245,7 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👇 Neeche menu se category chunein, phir pair pe tap karein — "
         "turant BUY/SELL/HOLD analysis reasons ke saath milega."
     )
-    await safe_reply(update, welcome_msg, reply_markup=main_menu_keyboard())
+    await safe_reply(update, context, welcome_msg, reply_markup=main_menu_keyboard(), track_nav=True)
 
 
 def _key_status(name: str, value: str) -> str:
@@ -228,19 +275,16 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"If GROQ_API_KEY is MISSING, every scan silently returns HOLD "
         f"and no signal is ever sent."
     )
-    await safe_reply(update, msg, reply_markup=main_menu_keyboard())
+    await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(), track_nav=True)
 
 
 async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/signal [PAIR] — instant manual check."""
     symbol = context.args[0].upper() if context.args else "BTCUSDT"
-    await safe_reply(update, f"🔍 Fetching analysis for `{symbol}`...")
-    try:
-        msg = await _run_analysis(symbol)
-        await safe_reply(update, msg, reply_markup=main_menu_keyboard())
-    except Exception as e:
-        logger.error(f"Manual signal error for {symbol}: {e}")
-        await safe_reply(update, f"⚠️ Error: {e}")
+    await safe_reply(update, context, f"🔍 Fetching analysis for `{symbol}`...", track_nav=True)
+    msg = await _run_analysis(symbol)
+    await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(),
+                      track_nav=True, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
 
 
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,7 +294,8 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
 
     if text == BACK_LABEL:
-        await safe_reply(update, f"🤖 {BRAND} — choose a category:", reply_markup=main_menu_keyboard())
+        await safe_reply(update, context, f"🤖 {BRAND} — choose a category:",
+                          reply_markup=main_menu_keyboard(), track_nav=True)
         return
 
     if text == STATUS_LABEL:
@@ -262,26 +307,29 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_data["auto_trade_enabled"] = turning_on
         _AUTO_STATE["enabled"] = turning_on
         msg = "✅ **Auto-Trade Activated!**" if turning_on else "🛑 **Auto-Trade Deactivated.**"
-        await safe_reply(update, msg, reply_markup=main_menu_keyboard())
+        await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(), track_nav=True)
         return
 
     if text in LABEL_TO_CATEGORY:
         cat_key = LABEL_TO_CATEGORY[text]
         label, _pairs = CATEGORIES[cat_key]
-        await safe_reply(update, f"{label} — pick a pair for instant analysis:", reply_markup=pair_menu_keyboard(cat_key))
+        await safe_reply(update, context, f"{label} — pick a pair for instant analysis:",
+                          reply_markup=pair_menu_keyboard(cat_key), track_nav=True)
         return
 
     symbol = text.upper()
     if symbol in ALL_PAIRS_SET or text in ALL_PAIRS_SET:
         symbol = symbol if symbol in ALL_PAIRS_SET else text
         cat_key = _category_of(symbol)
-        await safe_reply(update, f"🔍 Analyzing `{symbol}`...")
+        await safe_reply(update, context, f"🔍 Analyzing `{symbol}`...", track_nav=True)
         msg = await _run_analysis(symbol)
-        await safe_reply(update, msg, reply_markup=pair_menu_keyboard(cat_key))
+        await safe_reply(update, context, msg, reply_markup=pair_menu_keyboard(cat_key),
+                          track_nav=True, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
         return
 
     # Unrecognized free text — nudge back to the menu instead of staying silent.
-    await safe_reply(update, "Neeche menu se koi option chunein 👇", reply_markup=main_menu_keyboard())
+    await safe_reply(update, context, "Neeche menu se koi option chunein 👇",
+                      reply_markup=main_menu_keyboard(), track_nav=True)
 
 
 # ==================== APP BUILDER ====================
@@ -291,6 +339,7 @@ def build_app() -> Application:
 
     app.bot_data["active_chat_ids"] = set()
     app.bot_data["auto_trade_enabled"] = getattr(config, "AUTO_SCAN_ENABLED", False)
+    app.bot_data["nav_msg"] = {}
     _AUTO_STATE["enabled"] = app.bot_data["auto_trade_enabled"]
 
     app.add_handler(CommandHandler(["start", "help"], send_welcome))
