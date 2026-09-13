@@ -17,21 +17,31 @@ async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
     fvg = ind.detect_fvg(entry_df)
 
     swing_high, swing_low = ind.find_last_swing(entry_df)
-    last_price = entry_df.iloc[-1]["close"]
+    candle_close_price = entry_df.iloc[-1]["close"]
+    last_price = candle_close_price
     latest_atr = entry_df.iloc[-1]["atr"] if "atr" in entry_df.columns else (last_price * 0.001)
 
     # Candle-close price from TwelveData/Yahoo free-tier feeds can lag the
     # real market by a few minutes — pull a live spot quote for metals so the
-    # displayed price matches what you'd see on a broker/market chart.
+    # displayed price matches what you'd see on a broker/market chart. We
+    # rebase swing_high/swing_low by the same offset so the AI sees a
+    # self-consistent picture instead of a live price that contradicts
+    # stale-candle swing levels (which was making gold/silver setups look
+    # broken and default to HOLD almost every time).
     symbol_upper = symbol.upper()
+    live_price = None
     if symbol_upper in ("XAU/USD", "XAUUSD", "GOLD"):
         live_price = data_fetcher.fetch_goldapi_price("XAU")
-        if live_price:
-            last_price = live_price
     elif symbol_upper in ("XAG/USD", "XAGUSD", "SILVER"):
         live_price = data_fetcher.fetch_goldapi_price("XAG")
-        if live_price:
-            last_price = live_price
+
+    if live_price:
+        offset = live_price - candle_close_price
+        last_price = live_price
+        if swing_high is not None:
+            swing_high += offset
+        if swing_low is not None:
+            swing_low += offset
 
     exness_buffer = config.EXNESS_SPREAD_BUFFERS.get(symbol, 0.0002)
 
