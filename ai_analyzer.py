@@ -129,16 +129,22 @@ def _build_prompt(symbol: str, market_summary: dict) -> str:
     2. If 15m HTF Trend is BEARISH and 1m price is creating lower highs / rejection candles, generate "SELL".
     3. Do NOT stay in HOLD if there is a clear directional push or pattern alignment with 15m trend.
     4. If a high-impact news event is imminent for this pair's currency, lower confidence or prefer HOLD — news volatility can invalidate technical setups. If there is no high-impact news pending, say so explicitly as a positive factor.
-    5. Include Exness spread buffer ({market_summary.get('exness_buffer')}) in Stop Loss calculation.
+    5. Do NOT propose a trade at all unless the setup realistically has room to run at least 3x the stop distance before hitting the opposing swing level — if the nearest opposing structure is closer than that, prefer HOLD instead of a cramped trade.
     6. Set Confidence between 60% to 95% based on setup quality, adjusted down if high-impact news is pending.
     7. "reasons" MUST contain exactly 3 short items: [0] the core technical setup reason, [1] the Exness execution/risk logic, [2] an explicit statement of how the news/economic-calendar status above factored into this decision (even if the answer is "no high-impact news, so no adjustment made").
+
+    --- STOP LOSS RULES (read carefully — this is the only price level you set) ---
+    Take-profit levels are NOT your job — a fixed 1:1 / 1:2 / 1:3 target ladder gets computed automatically from your stop_loss. Your only price-placement task is the stop_loss, and it must be TIGHT and structurally justified, not a wide, arbitrary buffer:
+    - For BUY: stop_loss = just below the nearest of (the last rejection wick's low, the most recent swing low, or 1x ATR below entry) — whichever is CLOSEST to entry while still sitting beyond real invalidation. Do not pad it further "for safety" — a wide stop makes every target proportionally wider and harder to reach.
+    - For SELL: mirror the same logic above entry.
+    - Include the Exness spread buffer ({market_summary.get('exness_buffer')}) in the stop distance, but nowhere else.
+    - A stop distance much wider than 1x ATR is a signal you don't have a clean setup — prefer HOLD over forcing a trade with an oversized stop.
 
     Return ONLY valid raw JSON format, no markdown fences, no commentary:
     {{
       "signal": "BUY" | "SELL" | "HOLD",
       "confidence": number,
       "stop_loss": number,
-      "take_profit": number,
       "reasons": [
         "Core technical setup reason",
         "Exness execution & risk logic",
