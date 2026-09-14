@@ -235,6 +235,56 @@ def fetch_yfinance_crypto(symbol: str, interval="1m", outputsize=100):
         return None
 
 
+BITGET_INTERVAL_MAP = {"1m": "1min", "1min": "1min", "15m": "15min", "15min": "15min"}
+
+
+def fetch_bitget_crypto(symbol: str, interval="1m", outputsize=100):
+    """Bitget's public spot kline endpoint — a third crypto-exchange source
+    (after Binance/Bybit) with its own, different geo/IP-blocking policy, so
+    it stays useful on hosts where the other two are blocked."""
+    try:
+        clean_symbol = symbol.replace("/", "").replace("-", "").upper()
+        if clean_symbol.endswith("USD") and not clean_symbol.endswith("USDT"):
+            clean_symbol += "T"
+        if not (clean_symbol.endswith("USDT") or clean_symbol.endswith("USDC")):
+            clean_symbol += "USDT"
+
+        b_granularity = BITGET_INTERVAL_MAP.get(interval, "1min")
+        url = (
+            f"https://api.bitget.com/api/v2/spot/market/candles"
+            f"?symbol={clean_symbol}&granularity={b_granularity}&limit={outputsize}"
+        )
+
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            logger.error(f"Bitget HTTP {res.status_code} for {clean_symbol}: {res.text[:200]}")
+            return None
+
+        data = res.json()
+        if data.get("code") != "00000":
+            logger.error(f"Bitget API error for {clean_symbol}: {data.get('msg')}")
+            return None
+
+        rows = data.get("data", [])
+        if not rows:
+            logger.error(f"Bitget returned no candle data for {clean_symbol}")
+            return None
+
+        df = pd.DataFrame(rows, columns=[
+            "open_time", "open", "high", "low", "close",
+            "volume", "quote_volume", "usdt_volume"
+        ])
+        df['time'] = pd.to_datetime(df['open_time'].astype(float), unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+
+        df = df.sort_values('time').reset_index(drop=True)
+        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+    except Exception as e:
+        logger.error(f"Bitget fetch error for {symbol}: {e}")
+        return None
+
+
 def fetch_goldapi_price(metal: str = "XAU"):
     """Live spot price for XAU/XAG from goldapi.io — used to correct the
     'candle close' price (which can lag the real market by a few minutes on
@@ -266,7 +316,10 @@ def fetch_tf_data(symbol: str, interval: str):
             logger.warning(f"Binance failed for {symbol} — trying Bybit.")
             df = fetch_bybit_crypto(symbol, interval)
         if df is None or df.empty:
-            logger.warning(f"Bybit failed for {symbol} — falling back to Yahoo Finance.")
+            logger.warning(f"Bybit failed for {symbol} — trying Bitget.")
+            df = fetch_bitget_crypto(symbol, interval)
+        if df is None or df.empty:
+            logger.warning(f"Bitget failed for {symbol} — falling back to Yahoo Finance.")
             df = fetch_yfinance_crypto(symbol, interval)
         return df
 
@@ -275,14 +328,18 @@ def fetch_tf_data(symbol: str, interval: str):
     if df is None or df.empty:
         df = fetch_yfinance_forex(norm_symbol, interval)
 
-    # Last resort for gold specifically: PAXG is a gold-backed token traded on
-    # Binance/Bybit that tracks spot XAU/USD closely (~0.1-0.5% basis) — far
-    # more reliable uptime than TwelveData's free tier or Yahoo's unofficial API.
+    # Last resort for gold specifically: PAXG is a gold-backed token that
+    # tracks spot XAU/USD closely (~0.1-0.5% basis) — far more reliable
+    # uptime than TwelveData's free tier or Yahoo's unofficial API. Tried
+    # across three exchanges since each has its own, different geo/IP
+    # blocking policy — one being blocked doesn't mean the others are.
     if (df is None or df.empty) and norm_symbol.upper() in ("XAU/USD", "XAUUSD", "GOLD"):
         logger.warning("TwelveData + Yahoo failed for gold — trying PAXGUSDT (gold-backed token) as proxy.")
         df = fetch_binance_crypto("PAXGUSDT", interval)
         if df is None or df.empty:
             df = fetch_bybit_crypto("PAXGUSDT", interval)
+        if df is None or df.empty:
+            df = fetch_bitget_crypto("PAXGUSDT", interval)
 
     return df
 
