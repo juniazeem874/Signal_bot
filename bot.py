@@ -45,9 +45,20 @@ LAST_SIGNALS = {}
 # Wall-clock cooldown guard: {symbol: unix_timestamp_last_sent}
 LAST_SIGNAL_SENT_AT = {}
 
-# Tracks auto-trade state for rendering the keyboard label — the real
-# source of truth is application.bot_data["auto_trade_enabled"].
-_AUTO_STATE = {"enabled": True}
+# Per-chat auto-trade toggle: {chat_id: bool}, stored in bot_data so each of
+# the bot's users can turn their own auto-signals on/off independently. This
+# used to be a single global bool (bot_data["auto_trade_enabled"] plus a
+# mirrored _AUTO_STATE dict) shared by every chat, so one user's "Auto OFF"
+# silently turned it off for every other user too.
+DEFAULT_AUTO_ENABLED = getattr(config, "AUTO_SCAN_ENABLED", False)
+
+
+def _get_auto_enabled(bot_data: dict, chat_id) -> bool:
+    return bot_data.setdefault("auto_trade_chats", {}).get(chat_id, DEFAULT_AUTO_ENABLED)
+
+
+def _set_auto_enabled(bot_data: dict, chat_id, value: bool):
+    bot_data.setdefault("auto_trade_chats", {})[chat_id] = value
 
 
 # ==================== SEND HELPERS (Markdown-safe, single-screen, auto-delete) ====================
@@ -144,8 +155,8 @@ async def _delete_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== APP-STYLE BOTTOM MENU (persistent keyboard) ====================
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    auto_row = [AUTO_OFF_LABEL if _AUTO_STATE.get("enabled", True) else AUTO_ON_LABEL]
+def main_menu_keyboard(auto_enabled: bool) -> ReplyKeyboardMarkup:
+    auto_row = [AUTO_OFF_LABEL if auto_enabled else AUTO_ON_LABEL]
     return ReplyKeyboardMarkup(
         [
             [CATEGORIES["crypto"][0], CATEGORIES["forex"][0], CATEGORIES["metals"][0]],
@@ -184,8 +195,11 @@ def _format_signal_message(symbol: str, result: dict, header: str) -> str:
         f"**Price:** `{result.get('price', 'N/A')}`",
     ]
     if signal in ("BUY", "SELL"):
+        tps = result.get("take_profits") or {}
         lines += [
-            f"**Take Profit (TP):** `{result.get('take_profit', 'N/A')}`",
+            f"**TP1 (1:1):** `{tps.get('tp1', 'N/A')}`",
+            f"**TP2 (1:2):** `{tps.get('tp2', 'N/A')}`",
+            f"**TP3 (1:3):** `{tps.get('tp3', 'N/A')}`",
             f"**Stop Loss (SL):** `{result.get('stop_loss', 'N/A')}`",
         ]
     lines += [
@@ -221,7 +235,7 @@ _SCAN_ROTATION = {"offset": 0}
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """Runs every SCAN_INTERVAL seconds via the JobQueue and scans all pairs."""
     bot_data = context.application.bot_data
-    if not bot_data.get("auto_trade_enabled") or not bot_data.get("active_chat_ids"):
+    if not bot_data.get("active_chat_ids"):
         return
 
     logger.info("Scanning markets for entry setups...")
@@ -253,6 +267,13 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
             if signal == "HOLD":
                 continue
 
+            recipients = [
+                chat_id for chat_id in list(bot_data["active_chat_ids"])
+                if _get_auto_enabled(bot_data, chat_id)
+            ]
+            if not recipients:
+                continue  # nobody currently has auto-trade on — don't burn this pair's cooldown for no one
+
             now_ts = time.time()
             last_sent_ts = LAST_SIGNAL_SENT_AT.get(symbol)
             if last_sent_ts and (now_ts - last_sent_ts) < SIGNAL_COOLDOWN_SECONDS:
@@ -266,7 +287,7 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
             LAST_SIGNAL_SENT_AT[symbol] = now_ts
 
             msg = _format_signal_message(symbol, result, "AUTO SIGNAL")
-            for chat_id in list(bot_data["active_chat_ids"]):
+            for chat_id in recipients:
                 await safe_send(context, chat_id, msg, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
             signals_sent += 1
 
@@ -281,9 +302,9 @@ async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
 async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _delete_incoming(update, context)
     bot_data = context.application.bot_data
-    bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
-    bot_data["auto_trade_enabled"] = True
-    _AUTO_STATE["enabled"] = True
+    chat_id = update.effective_chat.id
+    bot_data.setdefault("active_chat_ids", set()).add(chat_id)
+    _set_auto_enabled(bot_data, chat_id, True)
 
     welcome_msg = (
         f"🤖 **{BRAND}**\n"
@@ -293,7 +314,7 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👇 Neeche menu se category chunein, phir pair pe tap karein — "
         "turant BUY/SELL/HOLD analysis reasons ke saath milega."
     )
-    await safe_reply(update, context, welcome_msg, reply_markup=main_menu_keyboard(), track_nav=True)
+    await safe_reply(update, context, welcome_msg, reply_markup=main_menu_keyboard(True), track_nav=True)
 
 
 def _key_status(name: str, value: str) -> str:
@@ -303,7 +324,8 @@ def _key_status(name: str, value: str) -> str:
 async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _delete_incoming(update, context)
     bot_data = context.application.bot_data
-    enabled = bot_data.get("auto_trade_enabled", False)
+    chat_id = update.effective_chat.id
+    enabled = _get_auto_enabled(bot_data, chat_id)
     status_str = "🟢 Active" if enabled else "🔴 Disabled"
 
     groq_status = _key_status("GROQ_API_KEY", getattr(config, "GROQ_API_KEY", ""))
@@ -313,7 +335,7 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"📊 {BRAND} — Bot Status:\n"
-        f"Auto-Trade: {status_str}\n"
+        f"Auto-Trade (this chat): {status_str}\n"
         f"Scan Interval: {SCAN_INTERVAL}s\n"
         f"Tracked Pairs: {len(DEFAULT_PAIRS)}\n\n"
         f"API Keys:\n"
@@ -324,16 +346,18 @@ async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"If GROQ_API_KEY is MISSING, every scan silently returns HOLD "
         f"and no signal is ever sent."
     )
-    await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(), track_nav=True)
+    await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(enabled), track_nav=True)
 
 
 async def manual_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/signal [PAIR] — instant manual check."""
     await _delete_incoming(update, context)
+    bot_data = context.application.bot_data
+    chat_id = update.effective_chat.id
     symbol = context.args[0].upper() if context.args else "BTCUSDT"
     await safe_reply(update, context, f"🔍 Fetching analysis for `{symbol}`...", track_nav=True)
     msg = await _run_analysis(symbol)
-    await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(),
+    await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(_get_auto_enabled(bot_data, chat_id)),
                       track_nav=False, delete_prev_nav=True, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
 
 
@@ -342,11 +366,12 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     await _delete_incoming(update, context)
     bot_data = context.application.bot_data
-    bot_data.setdefault("active_chat_ids", set()).add(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    bot_data.setdefault("active_chat_ids", set()).add(chat_id)
 
     if text == BACK_LABEL:
         await safe_reply(update, context, f"🤖 {BRAND} — choose a category:",
-                          reply_markup=main_menu_keyboard(), track_nav=True)
+                          reply_markup=main_menu_keyboard(_get_auto_enabled(bot_data, chat_id)), track_nav=True)
         return
 
     if text == STATUS_LABEL:
@@ -355,10 +380,9 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text in (AUTO_ON_LABEL, AUTO_OFF_LABEL):
         turning_on = text == AUTO_ON_LABEL
-        bot_data["auto_trade_enabled"] = turning_on
-        _AUTO_STATE["enabled"] = turning_on
+        _set_auto_enabled(bot_data, chat_id, turning_on)
         msg = "✅ **Auto-Trade Activated!**" if turning_on else "🛑 **Auto-Trade Deactivated.**"
-        await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(), track_nav=True)
+        await safe_reply(update, context, msg, reply_markup=main_menu_keyboard(turning_on), track_nav=True)
         return
 
     if text in LABEL_TO_CATEGORY:
@@ -380,7 +404,7 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Unrecognized free text — nudge back to the menu instead of staying silent.
     await safe_reply(update, context, "Neeche menu se koi option chunein 👇",
-                      reply_markup=main_menu_keyboard(), track_nav=True)
+                      reply_markup=main_menu_keyboard(_get_auto_enabled(bot_data, chat_id)), track_nav=True)
 
 
 # ==================== APP BUILDER ====================
@@ -389,9 +413,8 @@ def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.bot_data["active_chat_ids"] = set()
-    app.bot_data["auto_trade_enabled"] = getattr(config, "AUTO_SCAN_ENABLED", False)
+    app.bot_data["auto_trade_chats"] = {}
     app.bot_data["nav_msg"] = {}
-    _AUTO_STATE["enabled"] = app.bot_data["auto_trade_enabled"]
 
     app.add_handler(CommandHandler(["start", "help"], send_welcome))
     app.add_handler(CommandHandler("status", check_status))
