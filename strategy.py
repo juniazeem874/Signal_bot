@@ -71,13 +71,24 @@ async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
     if ai_result and "signal" in ai_result:
         signal = ai_result.get("signal", "HOLD").upper()
         raw_sl = ai_result.get("stop_loss")
-        raw_tp = ai_result.get("take_profit")
 
-        # Adjust SL/TP with Exness Buffer Padding
+        # Adjust SL with Exness Buffer Padding
         if signal == "BUY" and raw_sl:
             raw_sl -= exness_buffer
         elif signal == "SELL" and raw_sl:
             raw_sl += exness_buffer
+
+        take_profits = None
+        if raw_sl and signal in ("BUY", "SELL"):
+            risk = abs(last_price - raw_sl)
+            decimals = 2 if last_price >= 100 else (4 if last_price >= 1 else 6)
+            direction = 1 if signal == "BUY" else -1
+            take_profits = {
+                "tp1": round(last_price + direction * risk * 1, decimals),
+                "tp2": round(last_price + direction * risk * 2, decimals),
+                "tp3": round(last_price + direction * risk * 3, decimals),
+            }
+            raw_sl = round(raw_sl, decimals)
 
         return {
             "price": last_price,
@@ -86,8 +97,8 @@ async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
             "confidence": ai_result.get("confidence", 85),
             "reasons": ai_result.get("reasons", []),
             "stop_loss": raw_sl,
-            "take_profit": raw_tp,
-            "rr_ratio": getattr(config, "MIN_RISK_REWARD", 1.8),
+            "take_profits": take_profits,
+            "rr_ratio": "1:1 / 1:2 / 1:3 (TP1/TP2/TP3)",
             "market_summary": market_summary
         }
 
@@ -98,7 +109,7 @@ async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
         "confidence": 0,
         "reasons": ["Awaiting high-probability Exness confluence setup."],
         "stop_loss": None,
-        "take_profit": None,
+        "take_profits": None,
         "rr_ratio": None,
         "market_summary": market_summary
     }
