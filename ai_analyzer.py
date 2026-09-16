@@ -1,78 +1,116 @@
-import os, json, time, logging
+
+# ai_analyzer.py
+import json
+import time
+import logging
 import google.generativeai as genai
 from groq import Groq
 from config import (
-    GEMINI_API_KEY, GROQ_API_KEY, GEMINI_MODEL, GROQ_MODEL,
-    GEMINI_BATCH_SIZE
+    GEMINI_API_KEY, GROQ_API_KEY,
+    GEMINI_MODEL, GROQ_MODEL, GEMINI_BATCH_SIZE,
 )
+from indicators import add_indicators
 
 log = logging.getLogger(__name__)
 
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-groq_client  = Groq(api_key=GROQ_API_KEY)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+else:
+    gemini_model = None
+
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-# ================== INDICATOR BUNDLE BUILDER ==================
+# ================= INDICATOR BUNDLE BUILDER =================
 def build_indicator_bundle(symbol: str, tf_data: dict) -> dict:
     """
-    tf_data = { "4h": df, "1h": df, "15m": df, ... }
-    Har TF ke liye ek compact row banao — taake token kam lage.
+    Har TF ke liye COMPACT last-row summary — token optimize.
     """
     bundle = {"symbol": symbol, "timeframes": {}}
     for tf, df in tf_data.items():
         if df is None or df.empty:
             continue
-        last = df.iloc[-1]
-        bundle["timeframes"][tf] = {
-            "close":      round(float(last["close"]), 5),
-            "rsi":        round(float(last.get("rsi", 0)), 2),
-            "ema20":      round(float(last.get("ema20", 0)), 5),
-            "ema50":      round(float(last.get("ema50", 0)), 5),
-            "ema200":     round(float(last.get("ema200", 0)), 5),
-            "macd":       round(float(last.get("macd", 0)), 5),
-            "macd_sig":   round(float(last.get("macd_signal", 0)), 5),
-            "atr":        round(float(last.get("atr", 0)), 5),
-            "volume":     round(float(last.get("volume", 0)), 2),
-            "vol_avg":    round(float(df["volume"].tail(20).mean()), 2),
-            "vol_spike":  bool(last.get("volume", 0) > 1.5 * df["volume"].tail(20).mean()),
-            "trend":      str(last.get("trend", "NA")),      # up/down/sideways
-            "bos":        bool(last.get("bos", False)),
-            "fvg":        bool(last.get("fvg", False)),
-        }
+        try:
+            df = add_indicators(df)
+            if df.empty:
+                continue
+            last = df.iloc[-1]
+            vol_avg = float(df["volume"].tail(20).mean() or 1)
+            bundle["timeframes"][tf] = {
+                "close":     round(float(last["close"]), 5),
+                "rsi":       round(float(last.get("rsi") or 0), 2),
+                "ema20":     round(float(last.get("ema20") or 0), 5),
+                "ema50":     round(float(last.get("ema50") or 0), 5),
+                "ema200":    round(float(last.get("ema200") or 0), 5),
+                "macd":      round(float(last.get("macd") or 0), 5),
+                "macd_sig":  round(float(last.get("macd_signal") or 0), 5),
+                "atr":       round(float(last.get("atr") or 0), 5),
+                "volume":    round(float(last.get("volume") or 0), 2),
+                "vol_avg":   round(vol_avg, 2),
+                "vol_spike": bool(last.get("vol_spike", False)),
+                "trend":     str(last.get("trend", "NA")),
+                "bos":       bool(last.get("bos", False)),
+                "fvg":       bool(last.get("fvg", False)),
+            }
+        except Exception as e:
+            log.warning(f"bundle {symbol} {tf}: {e}")
     return bundle
 
 
-# ================== MASTER BATCH PROMPT ==================
+# ================= PROMPT =================
 SYSTEM_PROMPT = """You are a professional multi-asset trading analyst.
-You will receive a JSON array of 19 assets (crypto, forex, gold) with
-multi-timeframe indicator data (RSI, EMA20/50/200, MACD, ATR, Volume,
-Volume spike, Trend, BOS, FVG).
+You receive a JSON array of assets (crypto, forex, gold) with multi-timeframe
+indicator data: RSI, EMA20/50/200, MACD, ATR, Volume + volume spike, Trend,
+BOS (break of structure), FVG (fair value gap).
 
-For EACH symbol return a JSON object with:
-- symbol
-- signal: "BUY" | "SELL" | "HOLD"
-- confidence: 0-100
-- reason: <= 25 words
-- entry, stop_loss, take_profit (numbers, ATR-based)
-- top_indicators: list of 3 most decisive indicators
+For EACH asset return a JSON object with:
+  symbol, signal ("BUY"|"SELL"|"HOLD"), confidence (0-100),
+  reason (<=25 words), entry, stop_loss, take_profit,
+  top_indicators (list of 3 most decisive)
 
 Rules:
 1. Higher TF trend MUST agree before BUY/SELL on lower TF.
 2. RSI > 70 overbought, < 30 oversold.
 3. Volume spike confirms breakout.
-4. If signals conflict across TFs → HOLD.
-5. Return ONLY valid JSON array — no markdown fences.
+4. If TFs conflict → HOLD.
+5. ATR used for SL/TP distances.
+
+Return ONLY a valid JSON array. No markdown fences, no explanation.
 """
 
 
+# ================= PARSER =================
+def _parse_json(text: str) -> list:
+    text = text.strip()
+    for fence in ("```json", "```"):
+        text = text.removeprefix(fence)
+    text = text.removesuffix("```").strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            if "signals" in data:
+                return data["signals"]
+            return [data]
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.error(f"JSON parse fail: {e}\nRaw: {text[:400]}")
+        return []
+
+
+# ================= GEMINI =================
 def _call_gemini(batch: list) -> list:
+    if gemini_model is None:
+        raise RuntimeError("Gemini not configured")
     prompt = SYSTEM_PROMPT + "\n\nDATA:\n" + json.dumps(batch, separators=(",", ":"))
     resp = gemini_model.generate_content(prompt)
     return _parse_json(resp.text)
 
 
+# ================= GROQ =================
 def _call_groq(batch: list) -> list:
+    if groq_client is None:
+        raise RuntimeError("Groq not configured")
     resp = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
@@ -85,37 +123,42 @@ def _call_groq(batch: list) -> list:
     return _parse_json(resp.choices[0].message.content)
 
 
-def _parse_json(text: str) -> list:
-    text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "signals" in data:
-            return data["signals"]
-        return data if isinstance(data, list) else [data]
-    except Exception as e:
-        log.error(f"JSON parse fail: {e}\nRaw: {text[:500]}")
-        return []
-
-
-# ================== MAIN ENTRY (BATCHED + FALLBACK) ==================
-def analyze_all_pairs(bundles: list[dict]) -> list[dict]:
+# ================= MASTER =================
+def analyze_all_pairs(tf_data_per_symbol: dict) -> list:
     """
-    bundles = list of indicator bundles (19 pairs).
-    Sends EVERYTHING in ONE Gemini call; on failure → Groq fallback.
+    tf_data_per_symbol = { "BTCUSDT": {"4h": df, ...}, "EUR/USD": {...}, ... }
+    Sends ALL 19 pairs in ONE Gemini call.
+    Fallback → Groq → HOLD.
     """
+    # Build bundles
+    bundles = []
+    for sym, tf_data in tf_data_per_symbol.items():
+        b = build_indicator_bundle(sym, tf_data)
+        if b["timeframes"]:
+            bundles.append(b)
+
+    log.info(f"Bundles ready: {len(bundles)} pairs")
+
     results = []
     for i in range(0, len(bundles), GEMINI_BATCH_SIZE):
         batch = bundles[i : i + GEMINI_BATCH_SIZE]
         try:
-            log.info(f"Gemini batch {i//GEMINI_BATCH_SIZE + 1} — {len(batch)} pairs")
-            results.extend(_call_gemini(batch))
+            log.info(f"→ Gemini batch ({len(batch)} pairs)")
+            out = _call_gemini(batch)
+            if out:
+                results.extend(out)
+                continue
+            raise RuntimeError("Gemini returned empty")
         except Exception as e:
-            log.warning(f"Gemini failed → Groq fallback: {e}")
+            log.warning(f"Gemini failed → Groq: {e}")
             try:
-                results.extend(_call_groq(batch))
+                out = _call_groq(batch)
+                if out:
+                    results.extend(out)
+                    continue
+                raise RuntimeError("Groq returned empty")
             except Exception as e2:
-                log.error(f"Groq also failed: {e2}")
-                # neutral fallback so bot doesn't crash
+                log.error(f"Groq failed too: {e2}")
                 for b in batch:
                     results.append({
                         "symbol": b["symbol"], "signal": "HOLD",
@@ -123,5 +166,17 @@ def analyze_all_pairs(bundles: list[dict]) -> list[dict]:
                         "entry": 0, "stop_loss": 0, "take_profit": 0,
                         "top_indicators": [],
                     })
-        time.sleep(1.2)   # Gemini free-tier safety
+        time.sleep(1.2)
+
+    # Ensure every input symbol has a result
+    got = {r.get("symbol") for r in results}
+    for b in bundles:
+        if b["symbol"] not in got:
+            results.append({
+                "symbol": b["symbol"], "signal": "HOLD",
+                "confidence": 0, "reason": "No AI output",
+                "entry": 0, "stop_loss": 0, "take_profit": 0,
+                "top_indicators": [],
+            })
+
     return results
