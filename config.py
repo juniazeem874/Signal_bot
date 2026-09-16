@@ -67,8 +67,9 @@ def normalize_symbol(sym: str) -> str:
 
 
 # ==================== AI ====================
-GEMINI_MODEL      = "gemini-1.5-flash"
-GROQ_MODEL        = "llama-3.1-70b-versatile"
+# config.py me ye 2 lines change karo
+GEMINI_MODEL = "gemini-2.0-flash"           # ⭐ naya model
+GROQ_MODEL   = "openai/gpt-oss-120b"    # ⭐ naya model
 GEMINI_BATCH_SIZE = 19
 
 # ==================== STRATEGY ====================
