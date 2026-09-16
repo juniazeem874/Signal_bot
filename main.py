@@ -19,13 +19,15 @@ telegram_app = build_application()
 
 
 async def run_analysis_async():
+    """Full cycle: cleanup → fetch 19 pairs → AI → send signals."""
     try:
         cleanup_signals(telegram_app.bot)
         log.info("🔍 Fetching 19 pairs data...")
+
         raw = fetch_all_pairs_raw()
         log.info(f"📊 Data ready for {len(raw)} pairs")
 
-        log.info("🧠 Sending to AI (Gemini batch → Groq fallback)...")
+        log.info("🧠 Sending to AI...")
         results = analyze_all_pairs(raw)
         log.info(f"✅ AI returned {len(results)} signals")
 
@@ -49,7 +51,7 @@ def start_scheduler():
     scheduler.add_job(
         scheduled_job,
         "interval",
-        minutes=ANALYSIS_INTERVAL_MINUTES,
+        minutes=ANALYSIS_INTERVAL_MINUTES,   # ⭐ 5 minute
         id="analysis",
         max_instances=1,
         coalesce=True,
