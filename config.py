@@ -7,15 +7,11 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 
-# ==================== MULTIPLE CHAT IDs ====================
-# Railway Variables me: TELEGRAM_CHAT_IDS=123456789,987654321,-1001234567890
-# Ya single TELEGRAM_CHAT_ID bhi chalega (backward compatible)
+# ==================== CHAT IDs ====================
 _raw_ids = os.getenv("TELEGRAM_CHAT_IDS", "") or os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_CHAT_IDS = [
     int(cid.strip()) for cid in _raw_ids.split(",") if cid.strip().lstrip("-").isdigit()
 ]
-
-# Backward compat
 TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
 
 # ==================== PAIRS ====================
@@ -36,9 +32,9 @@ CRYPTO_TFS = ["4h", "1h", "15m", "5m", "1m"]
 FOREX_TFS  = ["4h", "1h", "15m"]
 
 # ==================== SCHEDULER ====================
-ANALYSIS_INTERVAL_MINUTES = 5
-SIGNAL_EXPIRY_HOURS       = 6
-REMOVE_HOLD_SIGNALS       = True
+ANALYSIS_INTERVAL_MINUTES = 60        # ⚠️ Aapne kaha "every 60s" — lekin 60 min recommended
+SIGNAL_EXPIRY_HOURS       = 6         # 6h baad hi delete
+REMOVE_HOLD_SIGNALS       = False     # ⚠️ HOLD mat delete karo — aapne sirf 6h kaha
 
 # ==================== AI ====================
 GEMINI_MODEL      = "gemini-1.5-flash"
@@ -58,5 +54,5 @@ TP_MULTIPLIERS = {
     "XAU/USD": 2.5, "EUR/USD": 2.0, "GBP/USD": 2.0, "USD/JPY": 2.0,
 }
 
-# ==================== SUBSCRIBERS (SQLite) ====================
+# ==================== SUBSCRIBERS DB ====================
 SUBSCRIBERS_DB = "subscribers.db"
