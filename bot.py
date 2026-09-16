@@ -1,6 +1,5 @@
 # bot.py
 import logging
-import traceback
 import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,26 +8,22 @@ from telegram.ext import (
     ContextTypes,
 )
 from config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS,
-    SIGNAL_EXPIRY_HOURS, REMOVE_HOLD_SIGNALS,
-    CRYPTO_PAIRS, FOREX_PAIRS, GOLD_PAIR,
-    GEMINI_API_KEY, GROQ_API_KEY, TWELVEDATA_API_KEY,
+    TELEGRAM_BOT_TOKEN, SIGNAL_EXPIRY_HOURS,
 )
-from data_fetcher import (
-    fetch_crypto_multi_tf, fetch_forex_multi_tf, fetch_gold_multi_tf,
-)
-from strategy import compute_signal
 from subscribers import (
     bootstrap_env_ids, subscribe, unsubscribe,
-    get_all_subscribers, count_subscribers,
+    set_auto_signal, is_auto_signal_on,
+    get_signal_subscribers, get_all_subscribers,
+    count_subscribers,
 )
 
 log = logging.getLogger(__name__)
 
-# Bootstrap env IDs → DB on import
 bootstrap_env_ids()
 
-# ACTIVE_SIGNALS: {symbol: {msg_id_by_chat: {chat_id: msg_id}, signal, ts}}
+BOT_NAME = "MJ TRADING"
+
+# ACTIVE_SIGNALS: {symbol: {"msg_ids": {chat_id: msg_id}, ...}}
 ACTIVE_SIGNALS: dict[str, dict] = {}
 
 
@@ -36,20 +31,18 @@ def save_signal(symbol: str, sig: dict, msg_ids: dict, chat_ids: list):
     ACTIVE_SIGNALS[symbol] = {
         **sig,
         "ts": datetime.utcnow(),
-        "msg_ids": msg_ids,      # {chat_id: message_id}
+        "msg_ids": msg_ids,
         "chat_ids": chat_ids,
     }
 
 
 def cleanup_signals(bot):
-    """6h purane + HOLD delete karo — sab chats se."""
+    """Sirf 6h purane delete karo."""
     now = datetime.utcnow()
     to_remove = []
     for sym, sig in list(ACTIVE_SIGNALS.items()):
         age = now - sig["ts"]
-        expired = age > timedelta(hours=SIGNAL_EXPIRY_HOURS)
-        is_hold = REMOVE_HOLD_SIGNALS and sig.get("signal") == "HOLD"
-        if expired or is_hold:
+        if age > timedelta(hours=SIGNAL_EXPIRY_HOURS):
             to_remove.append(sym)
 
     for sym in to_remove:
@@ -62,31 +55,88 @@ def cleanup_signals(bot):
         del ACTIVE_SIGNALS[sym]
 
     if to_remove:
-        log.info(f"🧹 Cleaned {len(to_remove)} signals")
+        log.info(f"🧹 Cleaned {len(to_remove)} signals (> {SIGNAL_EXPIRY_HOURS}h)")
+
+
+# ================== FORMAT SIGNAL (MJ TRADING STYLE) ==================
+def _calc_tps(sig: dict) -> tuple:
+    """TP1/TP2/TP3 (1:1, 1:2, 1:3) aur SL nikaalo."""
+    entry = float(sig.get("entry", 0) or 0)
+    sl = float(sig.get("stop_loss", 0) or 0)
+    action = sig.get("signal", "HOLD")
+
+    if entry <= 0 or sl <= 0 or action == "HOLD":
+        return (0, 0, 0, sl)
+
+    risk = abs(entry - sl)
+    if action == "BUY":
+        tp1 = entry + risk * 1
+        tp2 = entry + risk * 2
+        tp3 = entry + risk * 3
+    else:  # SELL
+        tp1 = entry - risk * 1
+        tp2 = entry - risk * 2
+        tp3 = entry - risk * 3
+    return (tp1, tp2, tp3, sl)
+
+
+def _format_reasons(sig: dict) -> str:
+    """Reasons ko bullet list me convert karo."""
+    raw = sig.get("reason", "") or "—"
+    # Agar multi-line already hai to use as is
+    if "•" in raw or "\n" in raw:
+        return raw
+
+    # Warna single string ko smartly split karo
+    parts = [p.strip() for p in raw.replace(";", ".").split(".") if p.strip()]
+    if not parts:
+        return "• No detailed reason available"
+    return "\n".join(f"• {p}." for p in parts[:3])
 
 
 def format_signal(sig: dict) -> str:
-    emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(sig["signal"], "⚪")
-    ind = ", ".join(sig.get("top_indicators", [])) or "—"
-    return (
-        f"{emoji} *{sig['symbol']}* — *{sig['signal']}*\n"
-        f"Confidence: {sig.get('confidence', 0)}%\n"
-        f"Entry: `{sig.get('entry', 0)}`\n"
-        f"SL: `{sig.get('stop_loss', 0)}`  |  TP: `{sig.get('take_profit', 0)}`\n"
-        f"Reason: {sig.get('reason', '—')}\n"
-        f"Indicators: {ind}"
-    )
+    action = sig.get("signal", "HOLD")
+    emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(action, "⚪")
+    entry = float(sig.get("entry", 0) or 0)
+    tp1, tp2, tp3, sl = _calc_tps(sig)
+    reasons = _format_reasons(sig)
+
+    lines = [
+        f"{emoji} *{BOT_NAME} — AUTO SIGNAL* {emoji}",
+        "",
+        f"Pair: *{sig.get('symbol', '?')}*",
+        f"Action: *{action}*",
+        f"Price: `{entry}`",
+    ]
+
+    if action != "HOLD" and tp1 > 0:
+        lines += [
+            f"TP1 (1:1): `{round(tp1, 2)}`",
+            f"TP2 (1:2): `{round(tp2, 2)}`",
+            f"TP3 (1:3): `{round(tp3, 2)}`",
+            f"Stop Loss (SL): `{round(sl, 2)}`",
+        ]
+
+    lines += [
+        f"Confidence: {sig.get('confidence', 0)}%",
+        "",
+        "*Reasons (why this trade):*",
+        reasons,
+    ]
+
+    return "\n".join(lines)
 
 
-# ============ MULTI-CHAT SENDER ============
+# ================== SEND SIGNAL ==================
 async def send_signal(application, sig: dict, chat_id_override: int = None):
-    """
-    Ek signal ko SAB subscribers ko bhejo.
-    chat_id_override diya to sirf usi ko bhejo.
-    """
-    chat_ids = [chat_id_override] if chat_id_override else get_all_subscribers()
+    """Sirf auto_signal=ON subscribers ko bhejo."""
+    if chat_id_override:
+        chat_ids = [chat_id_override]
+    else:
+        chat_ids = get_signal_subscribers()
+
     if not chat_ids:
-        log.error("❌ No subscribers — signal not sent")
+        log.warning("No auto-signal subscribers — skipping")
         return
 
     text = format_signal(sig)
@@ -103,7 +153,6 @@ async def send_signal(application, sig: dict, chat_id_override: int = None):
         except Exception as e:
             log.warning(f"send fail {sig['symbol']}→{cid}: {e}")
 
-    # Parallel send — sab chats ko ek saath
     await asyncio.gather(*[_send_one(cid) for cid in chat_ids])
 
     if msg_ids:
@@ -111,167 +160,101 @@ async def send_signal(application, sig: dict, chat_id_override: int = None):
         log.info(f"✅ {sig['symbol']} {sig['signal']} → {len(sent_to)} chats")
 
 
-# ============ HANDLERS ============
+# ================== /start ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("Crypto", callback_data="menu_crypto")],
-        [InlineKeyboardButton("Forex",  callback_data="menu_forex")],
-        [InlineKeyboardButton("Gold",   callback_data="menu_gold")],
-        [InlineKeyboardButton("🆔 My Chat ID", callback_data="menu_chatid")],
-        [InlineKeyboardButton("📊 Status",     callback_data="menu_status")],
-        [InlineKeyboardButton("🧪 Test Pipeline", callback_data="menu_test")],
-    ]
-    await update.message.reply_text(
-        f"🤖 *Signal Bot*\n"
-        f"Har 5 min auto-analysis — 19 pairs.\n"
-        f"Subscribers: *{count_subscribers()}*\n\n"
-        f"Commands:\n"
-        f"/start — menu\n"
-        f"/subscribe — signals receive karo\n"
-        f"/unsubscribe — signals band karo\n"
-        f"/signal BTCUSDT — manual signal\n"
-        f"/chatid — apna chat ID\n"
-        f"/status — bot health",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown",
-    )
-
-
-async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    uname = update.effective_user.username or update.effective_user.first_name or ""
-    subscribe(cid, uname)
-    await update.message.reply_text(
-        f"✅ Subscribed! Chat ID: `{cid}`\n"
-        f"Ab aapko har 5 min signals milenge.\n"
-        f"Total subscribers: *{count_subscribers()}*",
-        parse_mode="Markdown",
-    )
+    is_sub = cid in get_all_subscribers()
 
-
-async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    unsubscribe(cid)
-    await update.message.reply_text(
-        f"❌ Unsubscribed. Ab signals nahi aayenge.\n"
-        f"Wapas enable karne ke liye /subscribe bhejo.",
-    )
-
-
-async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Your chat ID: `{update.effective_chat.id}`\n\n"
-        f"Railway me `TELEGRAM_CHAT_IDS` me add karo:\n"
-        f"`{update.effective_chat.id}` (comma se multiple)",
-        parse_mode="Markdown",
-    )
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        f"📊 *Bot Status*\n\n"
-        f"Env chat IDs: `{TELEGRAM_CHAT_IDS}`\n"
-        f"DB subscribers: *{count_subscribers()}*\n"
-        f"Your chat ID: `{update.effective_chat.id}`\n"
-        f"Gemini key: {'✅' if GEMINI_API_KEY else '❌'}\n"
-        f"Groq key: {'✅' if GROQ_API_KEY else '❌'}\n"
-        f"TwelveData key: {'✅' if TWELVEDATA_API_KEY else '❌'}\n"
-        f"Active signals: {len(ACTIVE_SIGNALS)}"
-    )
-    await update.message.reply_text(txt, parse_mode="Markdown")
-
-
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Testing full pipeline...")
-    try:
-        from data_fetcher import fetch_all_pairs_raw
-        from ai_analyzer import analyze_all_pairs
-
-        raw = fetch_all_pairs_raw()
-        await update.message.reply_text(f"📊 Fetched {len(raw)} pairs. Calling AI...")
-        results = analyze_all_pairs(raw)
+    if is_sub:
+        auto_on = is_auto_signal_on(cid)
+        kb = [
+            [
+                InlineKeyboardButton(
+                    "🔴 Auto Signal OFF" if auto_on else "🟢 Auto Signal ON",
+                    callback_data="toggle_auto",
+                )
+            ],
+            [InlineKeyboardButton("❌ Unsubscribe", callback_data="unsubscribe")],
+        ]
+        status = "🟢 ON" if auto_on else "🔴 OFF"
         await update.message.reply_text(
-            f"✅ AI returned {len(results)} signals. Sending first 3 to ALL subscribers..."
+            f"🤖 *{BOT_NAME}*\n\n"
+            f"Aap subscribed ho ✅\n"
+            f"Auto Signal: *{status}*\n\n"
+            f"Tap button below to toggle.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
         )
-        for sig in results[:3]:
-            await send_signal(context.application, sig)
-    except Exception:
+    else:
+        kb = [[InlineKeyboardButton("✅ Subscribe", callback_data="subscribe")]]
         await update.message.reply_text(
-            f"❌ Error:\n```\n{traceback.format_exc()[:1000]}\n```",
+            f"🤖 *{BOT_NAME} — Signal Bot*\n\n"
+            f"Auto-scanning 19 pairs.\n"
+            f"BUY/SELL alerts automatically aayenge.\n\n"
+            f"Subscribe karo signals pane ke liye 👇",
+            reply_markup=InlineKeyboardMarkup(kb),
             parse_mode="Markdown",
         )
 
 
-async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /signal BTCUSDT")
-        return
-    sym = context.args[0].upper()
-    await update.message.reply_text(f"⏳ Fetching {sym}...")
-
-    if sym in CRYPTO_PAIRS:
-        tf_data = fetch_crypto_multi_tf(sym)
-    elif sym in FOREX_PAIRS:
-        tf_data = fetch_forex_multi_tf(sym)
-    elif sym == GOLD_PAIR:
-        tf_data = fetch_gold_multi_tf()
-    else:
-        await update.message.reply_text(f"❌ {sym} not supported.")
-        return
-
-    sig = compute_signal(sym, tf_data)
-    await update.message.reply_text(format_signal(sig), parse_mode="Markdown")
-
-
-async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== BUTTONS ==================
+async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
     cid = q.message.chat.id
+    uname = q.from_user.username or q.from_user.first_name or ""
 
-    if data == "menu_crypto":
-        await q.edit_message_text("Crypto pairs:\n" + "\n".join(CRYPTO_PAIRS))
-    elif data == "menu_forex":
-        await q.edit_message_text("Forex pairs:\n" + "\n".join(FOREX_PAIRS))
-    elif data == "menu_gold":
-        await q.edit_message_text(f"Gold: {GOLD_PAIR}")
-    elif data == "menu_chatid":
-        await q.edit_message_text(f"Your chat ID: `{cid}`", parse_mode="Markdown")
-    elif data == "menu_status":
-        txt = (
-            f"📊 *Status*\n"
-            f"Subscribers: *{count_subscribers()}*\n"
-            f"Your chat ID: `{cid}`\n"
-            f"Active signals: {len(ACTIVE_SIGNALS)}"
+    if data == "subscribe":
+        subscribe(cid, uname)
+        kb = [
+            [InlineKeyboardButton("🔴 Auto Signal OFF", callback_data="toggle_auto")],
+            [InlineKeyboardButton("❌ Unsubscribe", callback_data="unsubscribe")],
+        ]
+        await q.edit_message_text(
+            f"✅ *Subscribed!*\n\n"
+            f"Auto Signal: *🟢 ON*\n"
+            f"Ab signals automatically aayenge.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
         )
-        await q.edit_message_text(txt, parse_mode="Markdown")
-    elif data == "menu_test":
-        await q.edit_message_text("⏳ Running test...")
-        try:
-            from data_fetcher import fetch_all_pairs_raw
-            from ai_analyzer import analyze_all_pairs
-            raw = fetch_all_pairs_raw()
-            results = analyze_all_pairs(raw)
-            await q.message.reply_text(
-                f"✅ {len(results)} signals. Sending first 3 to ALL subscribers..."
-            )
-            for sig in results[:3]:
-                await send_signal(context.application, sig)
-        except Exception:
-            await q.message.reply_text(
-                f"❌ Error:\n```\n{traceback.format_exc()[:1000]}\n```",
-                parse_mode="Markdown",
-            )
+
+    elif data == "unsubscribe":
+        unsubscribe(cid)
+        kb = [[InlineKeyboardButton("✅ Subscribe", callback_data="subscribe")]]
+        await q.edit_message_text(
+            f"❌ *Unsubscribed*\n\n"
+            f"Signals band. Wapas subscribe karne ke liye tap karo.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
+
+    elif data == "toggle_auto":
+        current = is_auto_signal_on(cid)
+        new_state = not current
+        set_auto_signal(cid, new_state)
+        kb = [
+            [
+                InlineKeyboardButton(
+                    "🔴 Auto Signal OFF" if new_state else "🟢 Auto Signal ON",
+                    callback_data="toggle_auto",
+                )
+            ],
+            [InlineKeyboardButton("❌ Unsubscribe", callback_data="unsubscribe")],
+        ]
+        status = "🟢 ON" if new_state else "🔴 OFF"
+        await q.edit_message_text(
+            f"🤖 *{BOT_NAME}*\n\n"
+            f"Auto Signal: *{status}*\n\n"
+            f"{'Signals aayenge ✅' if new_state else 'Signals band 🚫'}",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
 
 
+# ================== BUILD ==================
 def build_application() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("subscribe", subscribe_cmd))
-    app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
-    app.add_handler(CommandHandler("signal", signal_cmd))
-    app.add_handler(CommandHandler("chatid", chatid_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("test", test_cmd))
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^menu_"))
+    app.add_handler(CallbackQueryHandler(button_cb))
     return app
