@@ -11,12 +11,15 @@ from config import (
     TELEGRAM_BOT_TOKEN, AUTO_SCAN_INTERVAL, BOT_NAME,
     CRYPTO_PAIRS, FOREX_PAIRS, METAL_PAIRS, GOLD_PAIR,
     SIGNAL_EXPIRY_HOURS, normalize_symbol,
+    TELEGRAM_CHAT_IDS,     # ⭐ NEW: list of IDs
+    TELEGRAM_CHAT_ID,      # ⭐ OLD: single ID (backward compat)
 )
 from data_fetcher import (
     fetch_crypto_multi_tf, fetch_forex_multi_tf, fetch_gold_multi_tf,
     get_current_price,
 )
-from ai_analyzer import analyze_all_pairs
+from ai_analyzer import analyze_ready_pairs   # ⭐ NEW: ready pairs analysis
+from strategies import find_ready_pairs         # ⭐ NEW: strategy filter
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 BRAND = "MJ TRADERS"
 
+# ==================== LABELS ====================
 BACK_LABEL     = "⬅️ Back"
 STATUS_LABEL   = "📊 Status"
 AUTO_ON_LABEL  = "🟢 Auto ON"
@@ -41,9 +45,11 @@ ALL_PAIRS_SET = {p for _l, pairs in CATEGORIES.values() for p in pairs}
 
 DEFAULT_AUTO_ENABLED = getattr(config, "AUTO_SCAN_ENABLED", True)
 
+# ==================== ACTIVE SIGNALS STORE ====================
 ACTIVE_SIGNALS = {}
 
 
+# ==================== AUTO ON/OFF PER CHAT ====================
 def _get_auto_enabled(bot_data, chat_id):
     return bot_data.setdefault("auto_trade_chats", {}).get(chat_id, DEFAULT_AUTO_ENABLED)
 
@@ -185,6 +191,7 @@ def _calc_tps(sig):
         return (entry - risk, entry - risk * 2, entry - risk * 3, sl)
 
 
+# ==================== REASONS FORMATTER ====================
 def _format_reasons(sig):
     raw = (sig.get("reason") or "").strip()
     if " • " in raw:
@@ -201,6 +208,7 @@ def _format_reasons(sig):
     return "\n".join(out)
 
 
+# ==================== PRICE GUARANTEE ====================
 def _ensure_price(sig):
     entry = float(sig.get("entry", 0) or 0)
     if entry > 0:
@@ -212,6 +220,7 @@ def _ensure_price(sig):
     return sig
 
 
+# ==================== SIGNAL FORMAT ====================
 def format_signal(sig):
     sig = _ensure_price(sig)
     action = sig.get("signal", "HOLD")
@@ -247,19 +256,37 @@ def format_signal(sig):
     if fib_note and action != "HOLD":
         lines.append(f"\n📐 *Fib:* {fib_note}")
 
+    smc_note = sig.get("smc_analysis")
+    if smc_note and action != "HOLD":
+        lines.append(f"🎯 *SMC:* {smc_note}")
+
     return "\n".join(lines)
 
 
-# ==================== SEND SIGNAL ====================
+# ==================== ⭐ SEND SIGNAL — MULTI CHAT ====================
 async def send_signal(application, sig, chat_id_override=None):
+    """
+    Signal bhejo 3 sources se:
+    1. chat_id_override (manual click)
+    2. active_chat_ids (jo /start bheje)
+    3. TELEGRAM_CHAT_IDS env list (fallback)
+    """
     bot_data = application.bot_data
+    
     if chat_id_override:
         chat_ids = [chat_id_override]
     else:
+        # Pehle active subscribers (jo /start bheje is session me)
         active = list(bot_data.get("active_chat_ids", set()))
         chat_ids = [cid for cid in active if _get_auto_enabled(bot_data, cid)]
+        
+        # Agar koi active nahi, to env list use karo
+        if not chat_ids and TELEGRAM_CHAT_IDS:
+            chat_ids = TELEGRAM_CHAT_IDS[:]
+            logger.info(f"📌 Using {len(chat_ids)} IDs from env: {chat_ids}")
+    
     if not chat_ids:
-        logger.warning("No subscribers")
+        logger.warning(f"⚠️ No subscribers for {sig.get('symbol')}")
         return
 
     text = format_signal(sig)
@@ -268,13 +295,17 @@ async def send_signal(application, sig, chat_id_override=None):
 
     async def _send_one(cid):
         try:
-            m = await application.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+            m = await application.bot.send_message(
+                chat_id=cid, text=text, parse_mode="Markdown"
+            )
             msg_ids[cid] = m.message_id
             sent_to.append(cid)
         except Exception as e:
-            logger.warning(f"send fail {sig.get('symbol')}→{cid}: {e}")
+            logger.warning(f"❌ send fail {sig.get('symbol')}→{cid}: {e}")
 
+    # Parallel send — sab IDs ko ek saath
     await asyncio.gather(*[_send_one(cid) for cid in chat_ids])
+
     if msg_ids:
         ACTIVE_SIGNALS[sig["symbol"]] = {
             **sig, "ts": datetime.utcnow(), "msg_ids": msg_ids,
@@ -282,7 +313,7 @@ async def send_signal(application, sig, chat_id_override=None):
         logger.info(f"✅ {sig['symbol']} {sig['signal']} → {len(sent_to)} chats")
 
 
-# ==================== CLEANUP ====================
+# ==================== CLEANUP (6h purane) ====================
 def cleanup_signals(bot):
     now = datetime.utcnow()
     to_remove = [s for s, v in list(ACTIVE_SIGNALS.items())
@@ -298,7 +329,7 @@ def cleanup_signals(bot):
         logger.info(f"🧹 Cleaned {len(to_remove)} signals")
 
 
-# ==================== MANUAL ANALYSIS ====================
+# ==================== MANUAL ANALYSIS (button click) ====================
 async def _run_analysis(symbol):
     try:
         if symbol in CRYPTO_PAIRS:
@@ -313,7 +344,12 @@ async def _run_analysis(symbol):
         if not tf_data:
             return f"❌ No market data for `{symbol}` — try again."
 
-        results = analyze_all_pairs({symbol: tf_data})
+        # ⭐ Strategy filter + AI
+        ready = find_ready_pairs({symbol: tf_data}, min_score=2)
+        if not ready:
+            return f"🟡 *{symbol}* — No clear setup right now"
+
+        results = analyze_ready_pairs(ready)
         if not results:
             return f"⚠️ AI analysis failed for `{symbol}`."
         return format_signal(results[0])
@@ -338,7 +374,9 @@ async def check_status(update, context):
         f"Auto: {'🟢 Active' if enabled else '🔴 Disabled'}\n"
         f"Interval: {AUTO_SCAN_INTERVAL // 60} min\n"
         f"Pairs: {len(ALL_PAIRS_SET)}\n"
-        f"Signal delete: {SIGNAL_EXPIRY_HOURS}h\n\n"
+        f"Signal delete: {SIGNAL_EXPIRY_HOURS}h\n"
+        f"Your chat ID: `{cid}`\n"
+        f"Env chat IDs: `{TELEGRAM_CHAT_IDS}`\n\n"
         f"Gemini: {_key_status('GEMINI', getattr(config, 'GEMINI_API_KEY', ''))}\n"
         f"Groq: {_key_status('GROQ', getattr(config, 'GROQ_API_KEY', ''))}\n"
         f"TwelveData: {_key_status('TD', getattr(config, 'TWELVEDATA_API_KEY', ''))}"
@@ -356,8 +394,9 @@ async def send_welcome(update, context):
     msg = (
         f"🤖 *{BRAND}*\n"
         f"Trading Signal Bot\n\n"
-        f"Auto-scanning every `{AUTO_SCAN_INTERVAL // 60} min` across `{len(ALL_PAIRS_SET)}` pairs — "
-        f"BUY/SELL/HOLD alerts automatically aayenge.\n\n"
+        f"Auto-scanning every `{AUTO_SCAN_INTERVAL // 60} min` — "
+        f"BUY/SELL/HOLD alerts with Fibonacci + SMC.\n\n"
+        f"Your chat ID: `{cid}`\n\n"
         "👇 Neeche menu se category chunein, phir pair pe tap karein."
     )
     await safe_reply(update, context, msg, reply_markup=get_main_keyboard(True), track_nav=True)
@@ -375,6 +414,12 @@ async def handle_menu_text(update, context):
         await send_welcome(update, context); return
     if text.startswith("/status"):
         await check_status(update, context); return
+    if text.startswith("/chatid") or text.startswith("/id"):
+        await safe_reply(update, context,
+                         f"Your chat ID: `{cid}`\n\n"
+                         f"Railway me `TELEGRAM_CHAT_IDS` me add karo (comma-separated).",
+                         parse_mode="Markdown")
+        return
     if text == BACK_LABEL:
         await safe_reply(update, context, f"🤖 {BRAND} — choose a category:",
                          reply_markup=get_main_keyboard(_get_auto_enabled(bd, cid)), track_nav=True)
@@ -393,6 +438,7 @@ async def handle_menu_text(update, context):
         await safe_reply(update, context, f"{lbl} — pick a pair:",
                          reply_markup=pair_menu_keyboard(ck), track_nav=True)
         return
+
     sym = normalize_symbol(text)
     if sym in ALL_PAIRS_SET:
         ck = _category_of(sym)
