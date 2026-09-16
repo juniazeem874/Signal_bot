@@ -55,7 +55,7 @@ BOT_END_HOUR_UTC   = 20
 WEEKEND_CRYPTO_ONLY = True
 
 # ==================== AI ====================
-GEMINI_MODEL      = "gemini-2.5-flash"
+GEMINI_MODEL      = "gemini-3.6-flash"
 GROQ_MODEL        = "openai/gpt-oss-120b"
 GEMINI_BATCH_SIZE = 10
 
