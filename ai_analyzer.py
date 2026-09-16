@@ -1,4 +1,3 @@
-
 # ai_analyzer.py
 import json
 import time
@@ -8,6 +7,7 @@ from groq import Groq
 from config import (
     GEMINI_API_KEY, GROQ_API_KEY,
     GEMINI_MODEL, GROQ_MODEL, GEMINI_BATCH_SIZE,
+    BOT_NAME,
 )
 from indicators import add_indicators
 
@@ -22,11 +22,9 @@ else:
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-# ================= INDICATOR BUNDLE BUILDER =================
+# ================= INDICATOR BUNDLE =================
 def build_indicator_bundle(symbol: str, tf_data: dict) -> dict:
-    """
-    Har TF ke liye COMPACT last-row summary — token optimize.
-    """
+    """Compact last-row summary per TF — token optimize."""
     bundle = {"symbol": symbol, "timeframes": {}}
     for tf, df in tf_data.items():
         if df is None or df.empty:
@@ -58,25 +56,32 @@ def build_indicator_bundle(symbol: str, tf_data: dict) -> dict:
     return bundle
 
 
-# ================= PROMPT =================
-SYSTEM_PROMPT = """You are a professional multi-asset trading analyst.
-You receive a JSON array of assets (crypto, forex, gold) with multi-timeframe
-indicator data: RSI, EMA20/50/200, MACD, ATR, Volume + volume spike, Trend,
-BOS (break of structure), FVG (fair value gap).
+# ================= PROMPT (MJ TRADING STYLE) =================
+SYSTEM_PROMPT = f"""You are a professional multi-asset trading analyst for a Telegram signals bot named {BOT_NAME}.
+You receive a JSON array of assets (crypto, forex, gold) with multi-timeframe indicator data:
+RSI, EMA20/50/200, MACD, ATR, Volume + volume spike, Trend, BOS (break of structure), FVG (fair value gap).
 
-For EACH asset return a JSON object with:
-  symbol, signal ("BUY"|"SELL"|"HOLD"), confidence (0-100),
-  reason (<=25 words), entry, stop_loss, take_profit,
-  top_indicators (list of 3 most decisive)
+For EACH asset return a JSON object with these EXACT keys:
+  symbol           : string (same as input)
+  signal           : "BUY" | "SELL" | "HOLD"
+  confidence       : integer 0-100
+  entry            : number (current price)
+  stop_loss        : number (ATR-based, on correct side)
+  reason           : string with EXACTLY 3 short bullet points separated by " • "
+  top_indicators   : array of 3 strings
+
+REASON FORMAT (STRICT):
+Use exactly this style, 3 bullets separated by " • ":
+"Bullish 15m trend with bullish rejection and higher lows on 1m supports a BUY. • Stop loss set just below entry by 1 ATR plus 0.35 spread buffer, staying above swing low for tight risk. • News feed unavailable; no high-impact events identified, so no news-based adjustment made."
 
 Rules:
 1. Higher TF trend MUST agree before BUY/SELL on lower TF.
 2. RSI > 70 overbought, < 30 oversold.
 3. Volume spike confirms breakout.
-4. If TFs conflict → HOLD.
-5. ATR used for SL/TP distances.
-
-Return ONLY a valid JSON array. No markdown fences, no explanation.
+4. If TFs conflict → HOLD, confidence low.
+5. ATR used for SL distance.
+6. "reason" MUST be ONE string with 3 sentences separated by " • " (space-bullet-space).
+7. Return ONLY a valid JSON array. NO markdown fences, NO explanation.
 """
 
 
@@ -91,7 +96,12 @@ def _parse_json(text: str) -> list:
         if isinstance(data, dict):
             if "signals" in data:
                 return data["signals"]
-            return [data]
+            if "symbol" in data:
+                return [data]
+            # single-key dict
+            for v in data.values():
+                if isinstance(v, list):
+                    return v
         return data if isinstance(data, list) else []
     except Exception as e:
         log.error(f"JSON parse fail: {e}\nRaw: {text[:400]}")
@@ -126,11 +136,9 @@ def _call_groq(batch: list) -> list:
 # ================= MASTER =================
 def analyze_all_pairs(tf_data_per_symbol: dict) -> list:
     """
-    tf_data_per_symbol = { "BTCUSDT": {"4h": df, ...}, "EUR/USD": {...}, ... }
-    Sends ALL 19 pairs in ONE Gemini call.
-    Fallback → Groq → HOLD.
+    tf_data_per_symbol = {"BTCUSDT": {"4h": df, ...}, ...}
+    ALL pairs → ONE Gemini call → Groq fallback.
     """
-    # Build bundles
     bundles = []
     for sym, tf_data in tf_data_per_symbol.items():
         b = build_indicator_bundle(sym, tf_data)
@@ -148,7 +156,7 @@ def analyze_all_pairs(tf_data_per_symbol: dict) -> list:
             if out:
                 results.extend(out)
                 continue
-            raise RuntimeError("Gemini returned empty")
+            raise RuntimeError("Gemini empty")
         except Exception as e:
             log.warning(f"Gemini failed → Groq: {e}")
             try:
@@ -156,27 +164,25 @@ def analyze_all_pairs(tf_data_per_symbol: dict) -> list:
                 if out:
                     results.extend(out)
                     continue
-                raise RuntimeError("Groq returned empty")
+                raise RuntimeError("Groq empty")
             except Exception as e2:
                 log.error(f"Groq failed too: {e2}")
                 for b in batch:
-                    results.append({
-                        "symbol": b["symbol"], "signal": "HOLD",
-                        "confidence": 0, "reason": "AI unavailable",
-                        "entry": 0, "stop_loss": 0, "take_profit": 0,
-                        "top_indicators": [],
-                    })
+                    results.append(_fallback_hold(b["symbol"], "AI unavailable"))
         time.sleep(1.2)
 
-    # Ensure every input symbol has a result
+    # Ensure every symbol has result
     got = {r.get("symbol") for r in results}
     for b in bundles:
         if b["symbol"] not in got:
-            results.append({
-                "symbol": b["symbol"], "signal": "HOLD",
-                "confidence": 0, "reason": "No AI output",
-                "entry": 0, "stop_loss": 0, "take_profit": 0,
-                "top_indicators": [],
-            })
+            results.append(_fallback_hold(b["symbol"], "No AI output"))
 
     return results
+
+
+def _fallback_hold(symbol: str, reason: str) -> dict:
+    return {
+        "symbol": symbol, "signal": "HOLD", "confidence": 0,
+        "reason": f"{reason}. • No confluence detected. • Waiting for clearer setup.",
+        "entry": 0, "stop_loss": 0, "top_indicators": [],
+    }
