@@ -7,9 +7,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from config import (
     AUTO_SCAN_INTERVAL, ALL_PAIRS, BOT_NAME,
     CRYPTO_PAIRS, FOREX_PAIRS, METAL_PAIRS,
+    BOT_START_HOUR_UTC, BOT_END_HOUR_UTC, WEEKEND_CRYPTO_ONLY,
 )
 from data_fetcher import fetch_all_pairs_raw, clear_cache
-from ai_analyzer import analyze_all_pairs, build_indicator_bundle
+from strategies import find_ready_pairs
+from ai_analyzer import analyze_ready_pairs
 from bot import build_app, send_signal, cleanup_signals
 from data_store import save_market_data, save_signals
 
@@ -22,58 +24,46 @@ log = logging.getLogger("main")
 telegram_app = build_app()
 
 
-# ==================== ANALYSIS RUNNER ====================
 async def run_analysis_async(only_crypto: bool = False):
-    """
-    only_crypto=True  → sirf crypto pairs (weekend)
-    only_crypto=False → sab 19 pairs
-    """
     try:
         cleanup_signals(telegram_app.bot)
         clear_cache()
 
-        # ==================== PAIRS SELECT ====================
+        # 1. Fetch
         if only_crypto:
-            pairs_to_fetch = CRYPTO_PAIRS
-            log.info(f"🪙 Weekend mode — fetching ONLY crypto ({len(pairs_to_fetch)} pairs)")
+            log.info(f"🪙 WEEKEND — fetching ONLY crypto ({len(CRYPTO_PAIRS)} pairs)")
         else:
-            pairs_to_fetch = ALL_PAIRS
-            log.info(f"🔍 Fetching all pairs ({len(pairs_to_fetch)})...")
+            log.info(f"🔍 Fetching all pairs ({len(ALL_PAIRS)})...")
 
-        # ==================== FETCH ====================
         raw_all = fetch_all_pairs_raw()
-
-        # Filter based on mode
-        if only_crypto:
-            raw = {sym: tf for sym, tf in raw_all.items() if sym in CRYPTO_PAIRS}
-        else:
-            raw = raw_all
-
+        raw = {s: t for s, t in raw_all.items() if s in CRYPTO_PAIRS} if only_crypto else raw_all
         log.info(f"📊 Fetched data for {len(raw)} pairs")
+
         if not raw:
-            log.error("❌ No data — skipping")
+            log.error("❌ No data")
             return
 
-        # ==================== BUILD BUNDLES ====================
-        bundles = {}
-        for sym, tf_data in raw.items():
-            b = build_indicator_bundle(sym, tf_data)
-            if b["timeframes"]:
-                bundles[sym] = b
-        log.info(f"📦 Bundles built: {len(bundles)} pairs")
+        # 2. Save market data (all pairs — for debugging)
+        save_market_data(raw)
 
-        # ==================== SAVE JSON ====================
-        save_market_data(bundles)
+        # 3. STRATEGY FILTER — kaunse pairs ready hain?
+        log.info("🎯 Scoring pairs for trade readiness...")
+        ready = find_ready_pairs(raw, min_score=3)
 
-        # ==================== AI ====================
-        log.info("🧠 Sending to AI...")
-        results = analyze_all_pairs(raw)
+        if not ready:
+            log.info("😴 No pairs ready this cycle — skipping AI")
+            save_signals([])
+            return
+
+        # 4. AI analysis (sirf ready pairs)
+        log.info(f"🧠 Sending {len(ready)} ready pairs to AI...")
+        results = analyze_ready_pairs(ready)
         log.info(f"✅ AI returned {len(results)} signals")
 
-        # ==================== SAVE SIGNALS ====================
+        # 5. Save signals
         save_signals(results)
 
-        # ==================== SEND ====================
+        # 6. Send to Telegram
         sent = 0
         for sig in results:
             if "AI unavailable" in (sig.get("reason") or ""):
@@ -86,9 +76,7 @@ async def run_analysis_async(only_crypto: bool = False):
         log.exception("❌ Analysis cycle crashed")
 
 
-# ==================== WEEKDAY JOB ====================
-def weekday_job():
-    """Mon-Fri, peak hours — all pairs."""
+def scheduled_job_weekday():
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
@@ -97,9 +85,7 @@ def weekday_job():
         loop.close()
 
 
-# ==================== WEEKEND JOB ====================
-def weekend_job():
-    """Sat-Sun — sirf crypto."""
+def scheduled_job_weekend():
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
@@ -108,48 +94,27 @@ def weekend_job():
         loop.close()
 
 
-# ==================== SCHEDULER ====================
 def start_scheduler():
-    """
-    Trial-safe scheduler:
-    - Weekdays: 8 AM - 1 AM PKT (3 AM - 8 PM UTC) — all pairs
-    - Weekends: sirf crypto
-    - Raat 1 AM - 8 AM PKT: bot sleep
-    """
     sch = BackgroundScheduler(timezone="UTC")
+    start_h = BOT_START_HOUR_UTC
+    end_h = BOT_END_HOUR_UTC
 
-    # ---- WEEKDAY JOB (Mon-Fri, 03:00-20:59 UTC, every 5 min) ----
     sch.add_job(
-        weekday_job,
-        "cron",
+        scheduled_job_weekday, "cron",
         day_of_week="mon-fri",
-        hour="3-20",
-        minute="*/5",
-        id="weekday_analysis",
-        max_instances=1,
-        coalesce=True,
+        hour=f"{start_h}-{end_h}", minute="*/5",
+        id="weekday_analysis", max_instances=1, coalesce=True,
     )
-
-    # ---- WEEKEND JOB (Sat-Sun, crypto only, 03:00-20:59 UTC, every 5 min) ----
     sch.add_job(
-        weekend_job,
-        "cron",
+        scheduled_job_weekend, "cron",
         day_of_week="sat,sun",
-        hour="3-20",
-        minute="*/5",
-        id="weekend_analysis",
-        max_instances=1,
-        coalesce=True,
+        hour=f"{start_h}-{end_h}", minute="*/5",
+        id="weekend_analysis", max_instances=1, coalesce=True,
     )
-
     sch.start()
-    log.info("⏰ Scheduler started")
-    log.info("   Weekdays: 03:00-20:59 UTC (8 AM - 1:59 AM PKT) — all pairs")
-    log.info("   Weekends: 03:00-20:59 UTC — crypto only")
-    log.info("   Sleep: 21:00-02:59 UTC (2 AM - 7:59 AM PKT)")
+    log.info(f"⏰ Scheduler started — 5 min interval (weekdays all, weekends crypto)")
 
 
-# ==================== MAIN ====================
 def main():
     start_scheduler()
     log.info(f"🤖 {BOT_NAME} — Telegram bot polling started...")
