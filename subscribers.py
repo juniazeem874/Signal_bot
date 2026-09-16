@@ -14,7 +14,7 @@ def _conn():
             chat_id INTEGER PRIMARY KEY,
             username TEXT,
             added_at TEXT,
-            active INTEGER DEFAULT 1
+            auto_signal INTEGER DEFAULT 1
         )
     """)
     c.commit()
@@ -22,21 +22,22 @@ def _conn():
 
 
 def bootstrap_env_ids():
-    """Railway env me jo IDs hain unhe DB me daal do (pehli baar)."""
+    """Railway env IDs ko DB me daalo (pehli baar)."""
     with _conn() as c:
         for cid in TELEGRAM_CHAT_IDS:
             c.execute(
-                "INSERT OR IGNORE INTO subscribers (chat_id, username, added_at) "
-                "VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO subscribers (chat_id, username, added_at, auto_signal) "
+                "VALUES (?, ?, ?, 1)",
                 (cid, "env", datetime.utcnow().isoformat()),
             )
         c.commit()
 
 
 def subscribe(chat_id: int, username: str = "") -> bool:
+    """Naya subscriber — auto_signal=ON by default."""
     with _conn() as c:
         c.execute(
-            "INSERT OR REPLACE INTO subscribers (chat_id, username, added_at, active) "
+            "INSERT OR REPLACE INTO subscribers (chat_id, username, added_at, auto_signal) "
             "VALUES (?, ?, ?, 1)",
             (chat_id, username, datetime.utcnow().isoformat()),
         )
@@ -53,12 +54,38 @@ def unsubscribe(chat_id: int) -> bool:
     return True
 
 
-def get_all_subscribers() -> list[int]:
-    """Sirf active subscribers."""
+def set_auto_signal(chat_id: int, enabled: bool) -> bool:
+    """Auto signal ON/OFF toggle."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE subscribers SET auto_signal = ? WHERE chat_id = ?",
+            (1 if enabled else 0, chat_id),
+        )
+        c.commit()
+    log.info(f"🔘 auto_signal={enabled} for {chat_id}")
+    return True
+
+
+def is_auto_signal_on(chat_id: int) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT auto_signal FROM subscribers WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+    return bool(row[0]) if row else False
+
+
+def get_signal_subscribers() -> list[int]:
+    """Sirf wo subscribers jinka auto_signal=1 hai."""
     with _conn() as c:
         rows = c.execute(
-            "SELECT chat_id FROM subscribers WHERE active = 1"
+            "SELECT chat_id FROM subscribers WHERE auto_signal = 1"
         ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_all_subscribers() -> list[int]:
+    with _conn() as c:
+        rows = c.execute("SELECT chat_id FROM subscribers").fetchall()
     return [r[0] for r in rows]
 
 
