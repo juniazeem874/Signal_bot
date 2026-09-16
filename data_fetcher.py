@@ -17,18 +17,21 @@ log = logging.getLogger(__name__)
 
 # ==================== ENDPOINTS ====================
 BINANCE_URL    = "https://api.binance.com/api/v3/klines"
+BINANCE_US_URL = "https://api.binance.us/api/v3/klines"
+BITGET_URL     = "https://api.bitget.com/api/v2/mix/market/candles"
+BYBIT_URL      = "https://api.bybit.com/v5/market/kline"
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 
-# Binance interval map
+# Interval maps
 TF_BINANCE = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
-# TwelveData interval map
-TF_TD = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day"}
-# yfinance interval map
-TF_YF = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d"}
+TF_BITGET  = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
+TF_BYBIT   = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+TF_TD      = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day"}
+TF_YF      = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d"}
 
-# Simple in-memory cache (per symbol+tf, TTL seconds)
+# Cache
 _CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
-CACHE_TTL = 60  # 60 sec — same cycle me dobara fetch nahi
+CACHE_TTL = 60
 
 
 # ==================== INDICATORS ====================
@@ -95,7 +98,6 @@ def _detect_fvg(df: pd.DataFrame) -> bool:
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Poora indicator stack add karo (RSI, EMA, MACD, ATR, Volume, BOS, FVG)."""
     if df is None or df.empty or len(df) < 30:
         return df
     df = df.copy()
@@ -113,7 +115,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ==================== FETCHERS ====================
+# ==================== CACHE ====================
 def _cache_get(key: str) -> pd.DataFrame:
     if key in _CACHE:
         ts, df = _CACHE[key]
@@ -126,47 +128,118 @@ def _cache_set(key: str, df: pd.DataFrame):
     _CACHE[key] = (time.time(), df)
 
 
+# ==================== BINANCE ====================
 def fetch_binance(symbol: str, interval: str = "15m", limit: int = CANDLES_PER_TF) -> pd.DataFrame:
-    """Crypto — Binance public API (no key, no rate limit issue)."""
     key = f"binance:{symbol}:{interval}"
     cached = _cache_get(key)
     if cached is not None:
         return cached
+    for url in [BINANCE_URL, BINANCE_US_URL]:
+        try:
+            params = {"symbol": symbol, "interval": interval, "limit": limit}
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                continue
+            df = pd.DataFrame(data, columns=[
+                "open_time", "open", "high", "low", "close", "volume",
+                "close_time", "qav", "trades", "tbb", "tbq", "ignore",
+            ])
+            for c in ["open", "high", "low", "close", "volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df = df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+            _cache_set(key, df)
+            return df
+        except Exception as e:
+            log.warning(f"Binance {url} fail {symbol} {interval}: {e}")
+    return pd.DataFrame()
 
+
+# ==================== BITGET ====================
+def fetch_bitget(symbol: str, interval: str = "15m", limit: int = CANDLES_PER_TF) -> pd.DataFrame:
+    """Bitget USDT-M futures candles."""
+    key = f"bitget:{symbol}:{interval}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
     try:
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        r = requests.get(BINANCE_URL, params=params, timeout=15)
+        params = {
+            "symbol": symbol,
+            "granularity": TF_BITGET.get(interval, "15m"),
+            "limit": min(limit, 1000),
+            "productType": "usdt-futures",
+        }
+        r = requests.get(BITGET_URL, params=params, timeout=10)
         r.raise_for_status()
-        data = r.json()
-        if not data or not isinstance(data, list):
-            log.warning(f"Binance empty: {symbol} {interval}")
+        js = r.json()
+        if js.get("code") != "00000" or not js.get("data"):
+            log.warning(f"Bitget empty {symbol}: {js.get('msg')}")
             return pd.DataFrame()
-        df = pd.DataFrame(data, columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "qav", "trades", "tbb", "tbq", "ignore",
+        # Bitget: [timestamp, open, high, low, close, baseVol, quoteVol]
+        df = pd.DataFrame(js["data"], columns=[
+            "time", "open", "high", "low", "close", "volume", "quoteVol"
         ])
+        df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="ms")
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["time"] = pd.to_datetime(df["open_time"], unit="ms")
-        df = df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+        df = df[["time", "open", "high", "low", "close", "volume"]]
+        df = df.sort_values("time").reset_index(drop=True)
         _cache_set(key, df)
         return df
     except Exception as e:
-        log.error(f"Binance fetch fail {symbol} {interval}: {e}")
+        log.warning(f"Bitget fail {symbol} {interval}: {e}")
         return pd.DataFrame()
 
 
+# ==================== BYBIT ====================
+def fetch_bybit(symbol: str, interval: str = "15m", limit: int = CANDLES_PER_TF) -> pd.DataFrame:
+    """Bybit v5 spot kline."""
+    key = f"bybit:{symbol}:{interval}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    try:
+        params = {
+            "category": "spot",
+            "symbol": symbol,
+            "interval": TF_BYBIT.get(interval, "15"),
+            "limit": min(limit, 1000),
+        }
+        r = requests.get(BYBIT_URL, params=params, timeout=10)
+        r.raise_for_status()
+        js = r.json()
+        if js.get("retCode") != 0 or not js.get("result", {}).get("list"):
+            log.warning(f"Bybit empty {symbol}: {js.get('retMsg')}")
+            return pd.DataFrame()
+        # Bybit: [startTime, open, high, low, close, volume, turnover]
+        df = pd.DataFrame(js["result"]["list"], columns=[
+            "time", "open", "high", "low", "close", "volume", "turnover"
+        ])
+        df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="ms")
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df[["time", "open", "high", "low", "close", "volume"]]
+        df = df.sort_values("time").reset_index(drop=True)
+        _cache_set(key, df)
+        return df
+    except Exception as e:
+        log.warning(f"Bybit fail {symbol} {interval}: {e}")
+        return pd.DataFrame()
+
+
+# ==================== TWELVEDATA (GOLD) ====================
 def fetch_twelvedata(symbol: str, interval: str = "1h", outputsize: int = CANDLES_PER_TF) -> pd.DataFrame:
-    """Gold — TwelveData (sirf ye 1 pair)."""
+    """Gold via TwelveData (XAU/USD)."""
     if not TWELVEDATA_API_KEY:
         log.error("TWELVEDATA_API_KEY missing")
         return pd.DataFrame()
-
     key = f"td:{symbol}:{interval}"
     cached = _cache_get(key)
     if cached is not None:
         return cached
-
     try:
         params = {
             "symbol": symbol,
@@ -194,25 +267,20 @@ def fetch_twelvedata(symbol: str, interval: str = "1h", outputsize: int = CANDLE
         return pd.DataFrame()
 
 
+# ==================== YFINANCE (FOREX) ====================
 def fetch_yfinance(symbol: str, interval: str = "1h", period: str = "60d") -> pd.DataFrame:
-    """Forex — yfinance (free, unlimited)."""
+    """Forex via yfinance (free unlimited)."""
     key = f"yf:{symbol}:{interval}"
     cached = _cache_get(key)
     if cached is not None:
         return cached
-
     try:
-        yf_sym = symbol.replace("/", "") + "=X"   # EUR/USD → EURUSD=X
+        yf_sym = symbol.replace("/", "") + "=X"
         yf_interval = TF_YF.get(interval, "1h")
-
-        # period auto: 1m/5m → 7d max, 15m → 60d, 1h+ → 60d
         if yf_interval in ("1m", "5m"):
             period = "7d"
         elif yf_interval == "15m":
             period = "60d"
-        else:
-            period = period
-
         df = yf.download(
             yf_sym, interval=yf_interval, period=period,
             progress=False, auto_adjust=False, threads=False,
@@ -220,9 +288,7 @@ def fetch_yfinance(symbol: str, interval: str = "1h", period: str = "60d") -> pd
         if df is None or df.empty:
             log.warning(f"yfinance empty: {symbol} {interval}")
             return pd.DataFrame()
-
         df = df.reset_index()
-        # Flatten MultiIndex columns (yfinance new versions)
         df.columns = [
             (str(c[0]).lower() if isinstance(c, tuple) else str(c).lower())
             for c in df.columns
@@ -237,19 +303,38 @@ def fetch_yfinance(symbol: str, interval: str = "1h", period: str = "60d") -> pd
         return pd.DataFrame()
 
 
+# ==================== CRYPTO FETCHER (3 Fallbacks) ====================
+def fetch_crypto(symbol: str, interval: str = "15m", limit: int = CANDLES_PER_TF) -> pd.DataFrame:
+    """Try Bitget → Bybit → Binance → Binance.US. First success wins."""
+    # 1. Bitget
+    df = fetch_bitget(symbol, interval, limit)
+    if not df.empty:
+        return df
+    log.info(f"Bitget failed {symbol}, trying Bybit...")
+    # 2. Bybit
+    df = fetch_bybit(symbol, interval, limit)
+    if not df.empty:
+        return df
+    log.info(f"Bybit failed {symbol}, trying Binance...")
+    # 3. Binance (US + Global)
+    df = fetch_binance(symbol, interval, limit)
+    if not df.empty:
+        return df
+    log.warning(f"All crypto sources failed for {symbol}")
+    return pd.DataFrame()
+
+
 # ==================== MULTI-TF FETCHERS ====================
 def fetch_crypto_multi_tf(symbol: str) -> dict:
-    """Crypto ke saare TFs (4h, 1h, 15m, 5m, 1m)."""
     out = {}
     for tf in CRYPTO_TFS:
-        df = fetch_binance(symbol, interval=TF_BINANCE.get(tf, tf), limit=CANDLES_PER_TF)
+        df = fetch_crypto(symbol, interval=TF_BINANCE.get(tf, tf), limit=CANDLES_PER_TF)
         if not df.empty:
             out[tf] = add_indicators(df)
     return out
 
 
 def fetch_forex_multi_tf(symbol: str) -> dict:
-    """Forex ke saare TFs (4h, 1h, 15m)."""
     out = {}
     for tf in FOREX_TFS:
         df = fetch_yfinance(symbol, interval=tf)
@@ -259,7 +344,7 @@ def fetch_forex_multi_tf(symbol: str) -> dict:
 
 
 def fetch_gold_multi_tf() -> dict:
-    """Gold — sirf TwelveData se (quota safe)."""
+    """Gold — TwelveData se."""
     out = {}
     for tf in METAL_TFS:
         df = fetch_twelvedata(GOLD_PAIR, interval=tf, outputsize=CANDLES_PER_TF)
@@ -270,19 +355,10 @@ def fetch_gold_multi_tf() -> dict:
 
 # ==================== MASTER FETCH ====================
 def fetch_all_pairs_raw() -> dict:
-    """
-    Saare 19 pairs ka multi-TF data ek dict me.
-    Returns:
-      {
-        "BTCUSDT": {"4h": df, "1h": df, "15m": df, "5m": df, "1m": df},
-        "EUR/USD": {"4h": df, "1h": df, "15m": df},
-        "XAU/USD": {"4h": df, "1h": df, "15m": df},
-        ...
-      }
-    """
+    """Saare 19 pairs ka multi-TF data."""
     all_data: dict[str, dict] = {}
 
-    # 1. Crypto — Binance
+    # 1. Crypto — Bitget + Bybit + Binance fallback
     for sym in CRYPTO_PAIRS:
         try:
             tf_data = fetch_crypto_multi_tf(sym)
@@ -300,7 +376,7 @@ def fetch_all_pairs_raw() -> dict:
         except Exception as e:
             log.error(f"Forex fetch fail {sym}: {e}")
 
-    # 3. Gold — TwelveData (sirf 1)
+    # 3. Gold — TwelveData
     for sym in METAL_PAIRS:
         try:
             tf_data = fetch_gold_multi_tf()
@@ -313,12 +389,9 @@ def fetch_all_pairs_raw() -> dict:
     return all_data
 
 
-# ==================== LEGACY SUPPORT (bot.py ke liye) ====================
+# ==================== LEGACY SUPPORT ====================
 def get_data(symbol: str):
-    """
-    Single pair ke liye (entry_df, trend_df) return karo.
-    Purane bot.py me ye function use hota tha.
-    """
+    """Single pair (entry_df, trend_df)."""
     if symbol in CRYPTO_PAIRS:
         tf_data = fetch_crypto_multi_tf(symbol)
     elif symbol in FOREX_PAIRS:
@@ -327,12 +400,7 @@ def get_data(symbol: str):
         tf_data = fetch_gold_multi_tf()
     else:
         return (None, None)
-
     if not tf_data:
         return (None, None)
-
-    # entry = sabse chhota TF, trend = sabse bada
     tfs = list(tf_data.keys())
-    entry_df = tf_data[tfs[-1]]   # last = smallest TF
-    trend_df = tf_data[tfs[0]]    # first = largest TF
-    return (entry_df, trend_df)
+    return (tf_data[tfs[-1]], tf_data[tfs[0]])
