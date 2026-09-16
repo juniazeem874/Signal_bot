@@ -2,13 +2,24 @@
 import asyncio
 import logging
 import time
+from datetime import datetime, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, MessageHandler, ContextTypes, filters,
+)
 
 import config
-import data_fetcher
-import strategy
+from config import (
+    TELEGRAM_BOT_TOKEN, AUTO_SCAN_INTERVAL, BOT_NAME,
+    CRYPTO_PAIRS, FOREX_PAIRS, METAL_PAIRS,
+    SIGNAL_EXPIRY_HOURS,
+)
+from data_fetcher import (
+    fetch_crypto_multi_tf, fetch_forex_multi_tf, fetch_gold_multi_tf,
+)
+from strategy import compute_signal
+from ai_analyzer import analyze_all_pairs
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -16,35 +27,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = getattr(config, "TELEGRAM_BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN missing in config.py / environment!")
-
 BRAND = "MJ TRADERS"
-SIGNAL_AUTO_DELETE_HOURS = 6
-SIGNAL_COOLDOWN_SECONDS = 6 * 60 * 60
+
+# ==================== CONSTANTS ====================
+BACK_LABEL    = "⬅️ Back"
+STATUS_LABEL  = "📊 Status"
+AUTO_ON_LABEL  = "🟢 Auto ON"
+AUTO_OFF_LABEL = "🔴 Auto OFF"
 
 CATEGORIES = {
-    "crypto": ("💰 Crypto", getattr(config, "CRYPTO_PAIRS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"])),
-    "forex":  ("💱 Forex",  getattr(config, "FOREX_PAIRS",  ["EUR/USD", "GBP/USD", "USD/JPY"])),
-    "metals": ("🥇 Gold",   getattr(config, "METAL_PAIRS",  ["XAU/USD", "XAG/USD"])),
+    "crypto": ("💰 Crypto", CRYPTO_PAIRS),
+    "forex":  ("💱 Forex",  FOREX_PAIRS),
+    "metals": ("🥇 Gold",   METAL_PAIRS),
 }
 LABEL_TO_CATEGORY = {label: key for key, (label, _pairs) in CATEGORIES.items()}
 ALL_PAIRS_SET = {p for _label, pairs in CATEGORIES.values() for p in pairs}
 
-BACK_LABEL = "⬅️ Back"
-STATUS_LABEL = "📊 Status"
-AUTO_ON_LABEL = "🟢 Auto ON"
-AUTO_OFF_LABEL = "🔴 Auto OFF"
-
-DEFAULT_PAIRS = getattr(config, "AUTO_SCAN_PAIRS", ["BTCUSDT", "XAU/USD", "EUR/USD", "GBP/USD", "USD/JPY"])
-SCAN_INTERVAL = getattr(config, "AUTO_SCAN_INTERVAL", 300)   # ⭐ 5 minute = 300 sec
-
-LAST_SIGNALS = {}
-LAST_SIGNAL_SENT_AT = {}
 DEFAULT_AUTO_ENABLED = getattr(config, "AUTO_SCAN_ENABLED", True)
 
 
+# ==================== ACTIVE SIGNALS (used by cleanup_signals) ====================
+# {symbol: {"signal": ..., "ts": datetime, "msg_ids": {chat_id: msg_id}}}
+ACTIVE_SIGNALS: dict[str, dict] = {}
+
+
+# ==================== AUTO ON/OFF per chat ====================
 def _get_auto_enabled(bot_data: dict, chat_id) -> bool:
     return bot_data.setdefault("auto_trade_chats", {}).get(chat_id, DEFAULT_AUTO_ENABLED)
 
@@ -113,7 +120,7 @@ async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str, auto
     try:
         sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Markdown send to {chat_id} failed: {e}")
+        logger.error(f"Markdown send to {chat_id} failed, retrying as plain text: {e}")
         try:
             sent = await context.bot.send_message(chat_id=chat_id, text=_strip_markdown(text))
         except Exception as e2:
@@ -133,7 +140,7 @@ async def _delete_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==================== KEYBOARDS ====================
-def main_menu_keyboard(auto_enabled: bool) -> ReplyKeyboardMarkup:
+def get_main_keyboard(auto_enabled: bool = True) -> ReplyKeyboardMarkup:
     auto_row = [AUTO_OFF_LABEL if auto_enabled else AUTO_ON_LABEL]
     return ReplyKeyboardMarkup(
         [
@@ -160,200 +167,251 @@ def _category_of(symbol: str) -> str:
 
 
 # ==================== SIGNAL FORMAT ====================
-def _format_signal_message(symbol: str, result: dict, header: str) -> str:
-    signal = result.get("signal", "HOLD")
-    icon = "🟢" if signal == "BUY" else ("🔴" if signal == "SELL" else "⏸️")
-    reasons = result.get("reasons") or []
-    reasons_str = "\n".join(f"• {r}" for r in reasons) if reasons else "Strategy conditions met"
+def _calc_tps(sig: dict) -> tuple:
+    """AI ke entry + SL se TP1/TP2/TP3 nikaalo (1:1, 1:2, 1:3)."""
+    entry = float(sig.get("entry", 0) or 0)
+    sl    = float(sig.get("stop_loss", 0) or 0)
+    action = sig.get("signal", "HOLD")
+    if entry <= 0 or sl <= 0 or action == "HOLD" or entry == sl:
+        return (0, 0, 0, sl)
+    risk = abs(entry - sl)
+    if action == "BUY":
+        return (entry + risk, entry + risk * 2, entry + risk * 3, sl)
+    else:
+        return (entry - risk, entry - risk * 2, entry - risk * 3, sl)
+
+
+def _format_reasons(sig: dict) -> str:
+    raw = (sig.get("reason") or sig.get("reasons") or "").strip()
+    if isinstance(raw, list):
+        parts = [str(p).strip() for p in raw if p]
+    elif " • " in raw:
+        parts = [p.strip() for p in raw.split(" • ") if p.strip()]
+    else:
+        parts = [p.strip() for p in raw.replace(";", ".").split(".") if p.strip()]
+    if not parts:
+        return "• No detailed reason available."
+    out = []
+    for p in parts[:3]:
+        if not p.endswith("."):
+            p += "."
+        out.append(f"• {p}")
+    return "\n".join(out)
+
+
+def format_signal(sig: dict) -> str:
+    action = sig.get("signal", "HOLD")
+    emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(action, "⚪")
+    entry = float(sig.get("entry", 0) or 0)
+    tp1, tp2, tp3, sl = _calc_tps(sig)
+    reasons = _format_reasons(sig)
 
     lines = [
-        f"{icon} **{BRAND} — {header}** {icon}",
+        f"{emoji} *{BRAND} — AUTO SIGNAL* {emoji}",
         "",
-        f"**Pair:** `{symbol}`",
-        f"**Action:** `{signal}`",
-        f"**Price:** `{result.get('price', 'N/A')}`",
+        f"Pair: *{sig.get('symbol', '?')}*",
+        f"Action: *{action}*",
+        f"Price: `{entry}`",
     ]
-    if signal in ("BUY", "SELL"):
-        tps = result.get("take_profits") or {}
+    if action != "HOLD" and tp1 > 0:
         lines += [
-            f"**TP1 (1:1):** `{tps.get('tp1', 'N/A')}`",
-            f"**TP2 (1:2):** `{tps.get('tp2', 'N/A')}`",
-            f"**TP3 (1:3):** `{tps.get('tp3', 'N/A')}`",
-            f"**Stop Loss (SL):** `{result.get('stop_loss', 'N/A')}`",
+            f"TP1 (1:1): `{round(tp1, 2)}`",
+            f"TP2 (1:2): `{round(tp2, 2)}`",
+            f"TP3 (1:3): `{round(tp3, 2)}`",
+            f"Stop Loss (SL): `{round(sl, 2)}`",
         ]
     lines += [
-        f"**Confidence:** `{result.get('confidence', 'N/A')}%`",
-        "**Reasons (why this trade):**",
-        reasons_str,
+        f"Confidence: {sig.get('confidence', 0)}%",
+        "",
+        "*Reasons (why this trade):*",
+        reasons,
     ]
     return "\n".join(lines)
 
 
-async def _run_analysis(symbol: str) -> str:
-    try:
-        entry_df, trend_df = data_fetcher.get_data(symbol)
-        if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
-            return f"❌ Market data empty for `{symbol}` — try again in a bit, or check Status."
+# ==================== SEND SIGNAL (used by main.py) ====================
+async def send_signal(application, sig: dict, chat_id_override: int = None):
+    """
+    Ek signal ko sab active chats ko bhejo.
+    chat_id_override diya to sirf usi ko.
+    """
+    bot_data = application.bot_data
+    if chat_id_override:
+        chat_ids = [chat_id_override]
+    else:
+        active = list(bot_data.get("active_chat_ids", set()))
+        chat_ids = [cid for cid in active if _get_auto_enabled(bot_data, cid)]
 
-        result = await strategy.analyze(entry_df, trend_df, symbol)
-        return _format_signal_message(symbol, result, "SIGNAL RESULT")
-    except Exception as e:
-        logger.error(f"_run_analysis crashed for {symbol}: {e}", exc_info=True)
-        return f"⚠️ Analysis failed for `{symbol}`: {e}\nTry again in a moment."
-
-
-# ==================== AUTO-SCAN ====================
-_SCAN_ROTATION = {"offset": 0}
-
-
-async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    bot_data = context.application.bot_data
-    if not bot_data.get("active_chat_ids"):
+    if not chat_ids:
+        logger.warning("No active chat subscribers — signal not sent")
         return
 
-    logger.info("Scanning markets for entry setups...")
-    signals_sent = 0
-    pairs_checked = 0
+    text = format_signal(sig)
+    msg_ids = {}
+    sent_to = []
 
-    offset = _SCAN_ROTATION["offset"] % len(DEFAULT_PAIRS)
-    ordered_pairs = DEFAULT_PAIRS[offset:] + DEFAULT_PAIRS[:offset]
-    _SCAN_ROTATION["offset"] = offset + 1
-    per_pair_delay = max(0.5, (SCAN_INTERVAL * 0.85) / max(len(ordered_pairs), 1))
-
-    for i, symbol in enumerate(ordered_pairs):
-        if i > 0:
-            await asyncio.sleep(per_pair_delay)
+    async def _send_one(cid: int):
         try:
-            entry_df, trend_df = data_fetcher.get_data(symbol)
-            if entry_df is None or trend_df is None or entry_df.empty or trend_df.empty:
-                logger.warning(f"Market data missing/empty for {symbol}")
-                continue
+            m = await application.bot.send_message(
+                chat_id=cid, text=text, parse_mode="Markdown",
+            )
+            msg_ids[cid] = m.message_id
+            sent_to.append(cid)
+        except Exception as e:
+            logger.warning(f"send fail {sig.get('symbol')}→{cid}: {e}")
 
-            pairs_checked += 1
-            result = await strategy.analyze(entry_df, trend_df, symbol)
-            signal = result.get("signal", "HOLD")
-            if signal == "HOLD":
-                continue
+    await asyncio.gather(*[_send_one(cid) for cid in chat_ids])
 
-            recipients = [
-                cid for cid in list(bot_data["active_chat_ids"])
-                if _get_auto_enabled(bot_data, cid)
-            ]
-            if not recipients:
-                continue
-
-            now_ts = time.time()
-            last_sent_ts = LAST_SIGNAL_SENT_AT.get(symbol)
-            if last_sent_ts and (now_ts - last_sent_ts) < SIGNAL_COOLDOWN_SECONDS:
-                continue
-
-            current_time_str = str(entry_df["time"].iloc[-1])
-            signal_key = f"{symbol}_{signal}_{current_time_str}"
-            if LAST_SIGNALS.get(symbol) == signal_key:
-                continue
-            LAST_SIGNALS[symbol] = signal_key
-            LAST_SIGNAL_SENT_AT[symbol] = now_ts
-
-            msg = _format_signal_message(symbol, result, "AUTO SIGNAL")
-            for cid in recipients:
-                await safe_send(context, cid, msg, auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
-            signals_sent += 1
-
-        except Exception as pair_err:
-            logger.error(f"Couldn't get signal for {symbol}: {pair_err}")
-
-    logger.info(f"Scan cycle done: {pairs_checked}/{len(DEFAULT_PAIRS)} pairs, {signals_sent} signal(s) sent.")
+    if msg_ids:
+        ACTIVE_SIGNALS[sig["symbol"]] = {
+            **sig,
+            "ts": datetime.utcnow(),
+            "msg_ids": msg_ids,
+        }
+        logger.info(f"✅ {sig['symbol']} {sig['signal']} → {len(sent_to)} chats")
 
 
-# ==================== HANDLERS (No Commands) ====================
-async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggered on first text message (not /start). Ye Telegram pe /start ka default handler nahi hai."""
-    await _delete_incoming(update, context)
-    bot_data = context.application.bot_data
-    chat_id = update.effective_chat.id
-    bot_data.setdefault("active_chat_ids", set()).add(chat_id)
-    _set_auto_enabled(bot_data, chat_id, True)
+# ==================== CLEANUP (used by main.py) ====================
+def cleanup_signals(bot):
+    """6h purane signals delete karo — HOLD bhi rahega."""
+    now = datetime.utcnow()
+    to_remove = []
+    for sym, sig in list(ACTIVE_SIGNALS.items()):
+        age = now - sig["ts"]
+        if age > timedelta(hours=SIGNAL_EXPIRY_HOURS):
+            to_remove.append(sym)
 
-    welcome_msg = (
-        f"🤖 **{BRAND}**\n"
-        f"Trading Signal Bot\n\n"
-        f"Auto-scanning every `{SCAN_INTERVAL // 60} min` across `{len(DEFAULT_PAIRS)}` pairs — "
-        f"you'll get BUY/SELL alerts automatically.\n\n"
-        "👇 Neeche menu se category chunein, phir pair pe tap karein — "
-        "turant BUY/SELL/HOLD analysis reasons ke saath milega."
-    )
-    await safe_reply(update, context, welcome_msg,
-                     reply_markup=main_menu_keyboard(True), track_nav=True)
+    for sym in to_remove:
+        info = ACTIVE_SIGNALS[sym]
+        for chat_id, msg_id in info.get("msg_ids", {}).items():
+            try:
+                bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception as e:
+                logger.warning(f"delete fail {sym}@{chat_id}: {e}")
+        del ACTIVE_SIGNALS[sym]
+
+    if to_remove:
+        logger.info(f"🧹 Cleaned {len(to_remove)} signals (> {SIGNAL_EXPIRY_HOURS}h)")
 
 
+# ==================== MANUAL ANALYSIS (from button click) ====================
+async def _run_analysis(symbol: str) -> str:
+    try:
+        if symbol in CRYPTO_PAIRS:
+            tf_data = fetch_crypto_multi_tf(symbol)
+        elif symbol in FOREX_PAIRS:
+            tf_data = fetch_forex_multi_tf(symbol)
+        elif symbol in METAL_PAIRS:
+            tf_data = fetch_gold_multi_tf()
+        else:
+            return f"❌ `{symbol}` not supported"
+
+        if not tf_data:
+            return f"❌ No market data for `{symbol}` — try again."
+
+        results = analyze_all_pairs({symbol: tf_data})
+        if not results:
+            return f"⚠️ AI analysis failed for `{symbol}`."
+
+        return format_signal(results[0])
+    except Exception as e:
+        logger.error(f"_run_analysis crashed for {symbol}: {e}", exc_info=True)
+        return f"⚠️ Analysis failed for `{symbol}`: {e}"
+
+
+# ==================== STATUS ====================
 def _key_status(name: str, value: str) -> str:
-    return "✅ set" if value else "❌ MISSING"
+    return "✅" if value else "❌ MISSING"
 
 
 async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _delete_incoming(update, context)
     bot_data = context.application.bot_data
-    chat_id = update.effective_chat.id
-    enabled = _get_auto_enabled(bot_data, chat_id)
-    status_str = "🟢 Active" if enabled else "🔴 Disabled"
-
-    groq_status = _key_status("GROQ_API_KEY", getattr(config, "GROQ_API_KEY", ""))
-    gemini_status = _key_status("GEMINI_API_KEY", getattr(config, "GEMINI_API_KEY", ""))
-    twelvedata_status = _key_status("TWELVEDATA_API_KEY", getattr(config, "TWELVEDATA_API_KEY", ""))
+    chat_id  = update.effective_chat.id
+    enabled  = _get_auto_enabled(bot_data, chat_id)
 
     msg = (
-        f"📊 {BRAND} — Bot Status:\n"
-        f"Auto-Trade (this chat): {status_str}\n"
-        f"Scan Interval: {SCAN_INTERVAL}s ({SCAN_INTERVAL // 60} min)\n"
-        f"Tracked Pairs: {len(DEFAULT_PAIRS)}\n"
-        f"Signal Auto-Delete: {SIGNAL_AUTO_DELETE_HOURS}h\n\n"
-        f"API Keys:\n"
-        f"`GROQ_API_KEY`: {groq_status}\n"
-        f"`GEMINI_API_KEY`: {gemini_status}\n"
-        f"`TWELVEDATA_API_KEY`: {twelvedata_status}\n\n"
-        f"If AI keys are MISSING, every scan silently returns HOLD."
+        f"📊 *{BRAND} — Status*\n"
+        f"Auto: {'🟢 Active' if enabled else '🔴 Disabled'}\n"
+        f"Interval: {AUTO_SCAN_INTERVAL // 60} min\n"
+        f"Pairs: {len(ALL_PAIRS_SET)}\n"
+        f"Signal delete: {SIGNAL_EXPIRY_HOURS}h\n\n"
+        f"Gemini: {_key_status('GEMINI', getattr(config, 'GEMINI_API_KEY', ''))}\n"
+        f"Groq: {_key_status('GROQ', getattr(config, 'GROQ_API_KEY', ''))}\n"
+        f"TwelveData: {_key_status('TWELVEDATA', getattr(config, 'TWELVEDATA_API_KEY', ''))}"
     )
     await safe_reply(update, context, msg,
-                     reply_markup=main_menu_keyboard(enabled), track_nav=True)
+                     reply_markup=get_main_keyboard(enabled), track_nav=True)
 
 
+# ==================== WELCOME (first text message) ====================
+async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_incoming(update, context)
+    bot_data = context.application.bot_data
+    chat_id  = update.effective_chat.id
+    bot_data.setdefault("active_chat_ids", set()).add(chat_id)
+    _set_auto_enabled(bot_data, chat_id, True)
+
+    welcome_msg = (
+        f"🤖 *{BRAND}*\n"
+        f"Trading Signal Bot\n\n"
+        f"Auto-scanning every `{AUTO_SCAN_INTERVAL // 60} min` across `{len(ALL_PAIRS_SET)}` pairs — "
+        f"BUY/SELL alerts automatically aayenge.\n\n"
+        "👇 Neeche menu se category chunein, phir pair pe tap karein — "
+        "turant analysis reasons ke saath milega."
+    )
+    await safe_reply(update, context, welcome_msg,
+                     reply_markup=get_main_keyboard(True), track_nav=True)
+
+
+# ==================== TEXT HANDLER ====================
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     await _delete_incoming(update, context)
     bot_data = context.application.bot_data
-    chat_id = update.effective_chat.id
+    chat_id  = update.effective_chat.id
     bot_data.setdefault("active_chat_ids", set()).add(chat_id)
 
-    # ===== BACK =====
+    # ---- /start bhi handle karo (welcome) ----
+    if text.startswith("/start") or text.startswith("/help"):
+        await send_welcome(update, context)
+        return
+
+    # ---- /status command ----
+    if text.startswith("/status"):
+        await check_status(update, context)
+        return
+
+    # ---- BACK ----
     if text == BACK_LABEL:
         await safe_reply(update, context, f"🤖 {BRAND} — choose a category:",
-                         reply_markup=main_menu_keyboard(_get_auto_enabled(bot_data, chat_id)),
+                         reply_markup=get_main_keyboard(_get_auto_enabled(bot_data, chat_id)),
                          track_nav=True)
         return
 
-    # ===== STATUS =====
+    # ---- STATUS ----
     if text == STATUS_LABEL:
         await check_status(update, context)
         return
 
-    # ===== AUTO ON/OFF =====
+    # ---- AUTO ON/OFF ----
     if text in (AUTO_ON_LABEL, AUTO_OFF_LABEL):
         turning_on = text == AUTO_ON_LABEL
         _set_auto_enabled(bot_data, chat_id, turning_on)
-        msg = "✅ **Auto-Trade Activated!**" if turning_on else "🛑 **Auto-Trade Deactivated.**"
+        msg = "✅ *Auto-Trade Activated!*" if turning_on else "🛑 *Auto-Trade Deactivated.*"
         await safe_reply(update, context, msg,
-                         reply_markup=main_menu_keyboard(turning_on), track_nav=True)
+                         reply_markup=get_main_keyboard(turning_on), track_nav=True)
         return
 
-    # ===== CATEGORY CLICK =====
+    # ---- CATEGORY ----
     if text in LABEL_TO_CATEGORY:
         cat_key = LABEL_TO_CATEGORY[text]
         label, _pairs = CATEGORIES[cat_key]
-        await safe_reply(update, context, f"{label} — pick a pair for instant analysis:",
+        await safe_reply(update, context, f"{label} — pick a pair:",
                          reply_markup=pair_menu_keyboard(cat_key), track_nav=True)
         return
 
-    # ===== PAIR CLICK =====
+    # ---- PAIR ----
     symbol = text.upper()
     if symbol in ALL_PAIRS_SET or text in ALL_PAIRS_SET:
         symbol = symbol if symbol in ALL_PAIRS_SET else text
@@ -362,28 +420,27 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await _run_analysis(symbol)
         await safe_reply(update, context, msg, reply_markup=pair_menu_keyboard(cat_key),
                          track_nav=False, delete_prev_nav=True,
-                         auto_delete_hours=SIGNAL_AUTO_DELETE_HOURS)
+                         auto_delete_hours=SIGNAL_EXPIRY_HOURS)
         return
 
-    # ===== UNKNOWN TEXT → Welcome (pehla message) =====
-    await safe_reply(update, context,
-                     "Neeche menu se koi option chunein 👇",
-                     reply_markup=main_menu_keyboard(_get_auto_enabled(bot_data, chat_id)),
-                     track_nav=True)
+    # ---- UNKNOWN: Welcome dikha do ----
+    await send_welcome(update, context)
 
 
-# ==================== APP BUILDER ====================
+# ==================== BUILD APP (used by main.py) ====================
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+    """Telegram Application object banao with handlers + keyboard."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN missing!")
 
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Bot state
     app.bot_data["active_chat_ids"] = set()
     app.bot_data["auto_trade_chats"] = {}
     app.bot_data["nav_msg"] = {}
 
-    # ⚠️ Sirf ek handler — sab kuch text messages se handle hoga
+    # Handler — sab text messages (commands + buttons)
     app.add_handler(MessageHandler(filters.TEXT, handle_menu_text))
-
-    # Auto-scan every SCAN_INTERVAL seconds
-    app.job_queue.run_repeating(auto_scan_job, interval=SCAN_INTERVAL, first=10)
 
     return app
