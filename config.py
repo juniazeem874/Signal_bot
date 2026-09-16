@@ -14,6 +14,10 @@ TELEGRAM_CHAT_IDS = [
 ]
 TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
 
+# ==================== BOT BRANDING ====================
+BOT_NAME = "MJ TRADING"
+BOT_TAGLINE = "Trading Signal Bot"
+
 # ==================== PAIRS ====================
 CRYPTO_PAIRS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
@@ -27,14 +31,44 @@ FOREX_PAIRS = [
 GOLD_PAIR = "XAU/USD"
 ALL_PAIRS = CRYPTO_PAIRS + FOREX_PAIRS + [GOLD_PAIR]
 
+# ==================== SYMBOL ALIASES ====================
+SYMBOL_ALIASES = {
+    # Gold
+    "XAUUSD": "XAU/USD", "GOLD": "XAU/USD", "XAU": "XAU/USD",
+    # Crypto USD → USDT
+    "BTCUSD": "BTCUSDT", "ETHUSD": "ETHUSDT", "SOLUSD": "SOLUSDT",
+    "BNBUSD": "BNBUSDT", "XRPUSD": "XRPUSDT", "ADAUSD": "ADAUSDT",
+    "DOGEUSD": "DOGEUSDT", "AVAXUSD": "AVAXUSDT",
+    "MATICUSD": "MATICUSDT", "LINKUSD": "LINKUSDT",
+    # Forex no-slash
+    "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY",
+    "AUDUSD": "AUD/USD", "USDCAD": "USD/CAD", "NZDUSD": "NZD/USD",
+    "USDCHF": "USD/CHF", "EURGBP": "EUR/GBP",
+}
+
+
+def normalize_symbol(sym: str) -> str:
+    """User input → internal symbol."""
+    if not sym:
+        return ""
+    s = sym.upper().strip().replace(" ", "")
+    if s in SYMBOL_ALIASES:
+        return SYMBOL_ALIASES[s]
+    no_slash = s.replace("/", "")
+    if no_slash in SYMBOL_ALIASES:
+        return SYMBOL_ALIASES[no_slash]
+    if s in ALL_PAIRS:
+        return s
+    return s
+
+
 # ==================== TIMEFRAMES ====================
 CRYPTO_TFS = ["4h", "1h", "15m", "5m", "1m"]
 FOREX_TFS  = ["4h", "1h", "15m"]
 
 # ==================== SCHEDULER ====================
-ANALYSIS_INTERVAL_MINUTES = 60        # ⚠️ Aapne kaha "every 60s" — lekin 60 min recommended
-SIGNAL_EXPIRY_HOURS       = 6         # 6h baad hi delete
-REMOVE_HOLD_SIGNALS       = False     # ⚠️ HOLD mat delete karo — aapne sirf 6h kaha
+ANALYSIS_INTERVAL_MINUTES = 60
+SIGNAL_EXPIRY_HOURS       = 6
 
 # ==================== AI ====================
 GEMINI_MODEL      = "gemini-1.5-flash"
@@ -54,5 +88,5 @@ TP_MULTIPLIERS = {
     "XAU/USD": 2.5, "EUR/USD": 2.0, "GBP/USD": 2.0, "USD/JPY": 2.0,
 }
 
-# ==================== SUBSCRIBERS DB ====================
+# ==================== DB ====================
 SUBSCRIBERS_DB = "subscribers.db"
