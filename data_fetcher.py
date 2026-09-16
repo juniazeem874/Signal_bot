@@ -239,15 +239,18 @@ def fetch_twelvedata(symbol, interval="1h", outputsize=CANDLES_PER_TF):
         df["datetime"] = pd.to_datetime(df["datetime"])
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
+        # ⭐ FIX: Volume column missing ho to 0
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+        else:
+            df["volume"] = 0.0
         df = df.rename(columns={"datetime": "time"}).sort_values("time").reset_index(drop=True)
-        df = df[["time","open","high","low","close","volume"]]
+        df = df[["time", "open", "high", "low", "close", "volume"]]
         _cache_set(key, df)
         return df
     except Exception as e:
         log.error(f"TwelveData exception {symbol}: {e}")
         return pd.DataFrame()
-
 
 # ==================== YFINANCE (FOREX) ====================
 def fetch_yfinance(symbol, interval="1h", period="60d"):
