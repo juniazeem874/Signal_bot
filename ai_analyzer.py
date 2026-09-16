@@ -1,3 +1,4 @@
+8
 # ai_analyzer.py
 import json
 import time
@@ -10,7 +11,6 @@ from config import (
     GEMINI_MODEL, GROQ_MODEL, GEMINI_BATCH_SIZE,
     BOT_NAME,
 )
-from indicators import add_indicators, fibonacci_retracement
 
 log = logging.getLogger(__name__)
 
@@ -23,100 +23,45 @@ else:
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-# ==================== BUNDLE BUILDER ====================
-def build_indicator_bundle(symbol, tf_data):
-    """Har pair ka compact bundle with Fibonacci."""
-    bundle = {"symbol": symbol, "timeframes": {}}
-
-    for tf, df in tf_data.items():
-        if df is None or df.empty:
-            continue
-        try:
-            if "rsi" not in df.columns:
-                df = add_indicators(df)
-            if df.empty:
-                continue
-            last = df.iloc[-1]
-            vol_avg = float(df["volume"].tail(20).mean() or 1)
-
-            tf_out = {
-                "close":     round(float(last["close"]), 6),
-                "rsi":       round(float(last.get("rsi") or 0), 2),
-                "ema20":     round(float(last.get("ema20") or 0), 6),
-                "ema50":     round(float(last.get("ema50") or 0), 6),
-                "ema200":    round(float(last.get("ema200") or 0), 6),
-                "macd":      round(float(last.get("macd") or 0), 6),
-                "macd_sig":  round(float(last.get("macd_signal") or 0), 6),
-                "atr":       round(float(last.get("atr") or 0), 6),
-                "volume":    round(float(last.get("volume") or 0), 2),
-                "vol_avg":   round(vol_avg, 2),
-                "vol_spike": bool(last.get("vol_spike", False)),
-                "trend":     str(last.get("trend", "NA")),
-                "bos":       bool(last.get("bos", False)),
-                "fvg":       bool(last.get("fvg", False)),
-            }
-
-            # Fibonacci add karo
-            fib = fibonacci_retracement(df, lookback=50)
-            if fib:
-                tf_out["fibonacci"] = {
-                    "direction":     fib["direction"],
-                    "swing_high":    fib["swing_high"],
-                    "swing_low":     fib["swing_low"],
-                    "levels":        fib["levels"],
-                    "golden_zone":   fib["golden_zone"],
-                    "current_zone":  fib["current_zone"],
-                    "nearest_level": fib["nearest_level"],
-                }
-
-            bundle["timeframes"][tf] = tf_out
-        except Exception as e:
-            log.warning(f"bundle {symbol} {tf}: {e}")
-
-    return bundle
-
-
-def _last_price_from_bundle(b):
-    tfs = list(b.get("timeframes", {}).keys())
-    for tf in reversed(tfs):
-        c = b["timeframes"][tf].get("close")
-        if c:
-            return float(c)
-    return 0.0
-
-
 # ==================== PROMPT ====================
 SYSTEM_PROMPT = f"""You are a professional multi-asset trading analyst for {BOT_NAME} signals channel.
 
-You receive a JSON array of assets with multi-timeframe indicators AND Fibonacci retracement data.
+You receive a JSON array of PRE-FILTERED trading setups. Each pair was selected because it shows 
+strategy confluence: multi-TF trend, RSI, Volume spike, BOS (Break of Structure), FVG (Fair Value Gap), 
+and/or Fibonacci retracement alignment.
 
-For each asset you have:
-  - Multi-TF data: RSI, EMA20/50/200, MACD, ATR, Volume, Volume spike, Trend, BOS, FVG
-  - Fibonacci retracement: levels (0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0), golden zone, current zone
+Each item includes:
+  - symbol, score (0-6), direction_hint ("BUY" | "SELL"), reasons (list)
+  - tf_summary: per-TF data with close, rsi, ema20/50/200, macd, atr, trend, bos, fvg, vol_spike, fibonacci
 
-For EACH asset return a JSON object with EXACT keys:
+Your job:
+1. Confirm or reject the direction hint using the indicators
+2. Provide entry, stop_loss, take_profit
+3. Explain WHY (3 bullet reasons separated by " • ")
+4. Rate confidence 0-100
+
+For EACH asset return JSON object with EXACT keys:
   symbol         : string
   signal         : "BUY" | "SELL" | "HOLD"
   confidence     : integer 0-100
   entry          : number (current price from smallest TF close) — NEVER 0
-  stop_loss      : number (ATR-based or beyond nearest Fib level)
-  take_profit    : number (1:2 risk-reward minimum)
-  reason         : string with 3 sentences separated by " • "
-  fib_analysis   : string — how Fibonacci influences this trade
+  stop_loss      : number (use ATR × 1.5 or Fibonacci level)
+  take_profit    : number (1:2 minimum risk-reward)
+  reason         : string with EXACTLY 3 sentences separated by " • "
+  fib_analysis   : string — how Fibonacci influenced this trade
+  smc_analysis   : string — BOS/FVG confluence note
   top_indicators : array of 3 strings
 
 CRITICAL RULES:
-1. entry MUST always be > 0. Use current close. NEVER 0.
-2. Use Fibonacci:
-   - Price IN_GOLDEN_ZONE + trend up → strong BUY
-   - Price at 0.5/0.618 rejection in uptrend → BUY
-   - Price at 0.5/0.618 rejection in downtrend → SELL
-   - Price breaks 0.786 → continuation
-3. Confluence: BOS + FVG + Volume spike + Fib alignment → high confidence.
-4. If TFs conflict AND no Fib alignment → HOLD, low confidence.
-5. Bias towards actionable BUY/SELL when Fib + trend align.
-6. SL should respect nearest Fibonacci level.
-7. Return ONLY valid JSON array, no markdown fences, no explanation.
+1. entry MUST always be > 0. Use current close.
+2. If setup has 3+ confluences and Fibonacci alignment → confidence 70-90
+3. If setup is weak or conflicting → HOLD with confidence 30-50
+4. Use Fibonacci:
+   - Price IN_GOLDEN_ZONE + trend up → BUY with strong SL below 0.786
+   - Price IN_GOLDEN_ZONE + trend down → SELL with strong SL above 0.786
+   - Price breaks 0.786 → continuation trade
+5. SL must respect nearest Fib level (place SL just beyond it)
+6. Return ONLY valid JSON array, no markdown fences.
 """
 
 
@@ -173,21 +118,48 @@ def _fallback_hold(symbol, reason, last_price=0.0):
         "reason": f"{reason}. • No confluence detected. • Waiting for clearer setup.",
         "entry": last_price, "stop_loss": 0, "take_profit": 0,
         "fib_analysis": "Unavailable",
+        "smc_analysis": "Unavailable",
         "top_indicators": [],
     }
 
 
-# ==================== MASTER ====================
-def analyze_all_pairs(tf_data_per_symbol):
-    """Bundles → chunks → AI (Gemini primary, Groq fallback)."""
+# ==================== MASTER — AI ONLY FOR READY PAIRS ====================
+def analyze_ready_pairs(ready_pairs: list[dict]) -> list[dict]:
+    """
+    Sirf ready pairs AI ko bhejo — chhota payload.
+    
+    ready_pairs = [
+        {
+            "symbol": "BTCUSDT",
+            "score": 4,
+            "direction": "BUY",
+            "reasons": [...],
+            "tf_summary": {...}
+        },
+        ...
+    ]
+    """
+    if not ready_pairs:
+        log.info("⚠️ No ready pairs — skipping AI")
+        return []
+
+    # Compact format for AI
     bundles = []
-    for sym, tf_data in tf_data_per_symbol.items():
-        b = build_indicator_bundle(sym, tf_data)
-        if b["timeframes"]:
-            bundles.append(b)
+    for rp in ready_pairs:
+        bundle = {
+            "symbol": rp["symbol"],
+            "score": rp["score"],
+            "direction_hint": rp["direction"],
+            "reasons": rp["reasons"],
+            "tf_summary": rp["tf_summary"],
+        }
+        bundles.append(bundle)
 
-    log.info(f"📦 Bundles ready: {len(bundles)} pairs (with Fibonacci)")
+    log.info(f"📦 AI payload: {len(bundles)} ready pairs")
+    total_chars = len(json.dumps(bundles, separators=(",", ":")))
+    log.info(f"📊 Payload size: {total_chars} chars (~{total_chars // 4} tokens)")
 
+    # Chunk
     chunks = [bundles[i:i+GEMINI_BATCH_SIZE] for i in range(0, len(bundles), GEMINI_BATCH_SIZE)]
     log.info(f"🔪 {len(chunks)} chunks of {GEMINI_BATCH_SIZE}")
 
@@ -196,13 +168,16 @@ def analyze_all_pairs(tf_data_per_symbol):
         log.info(f"→ Chunk {idx}/{len(chunks)} ({len(chunk)} pairs)")
 
         out = None
+
+        # Try Gemini first
         try:
             out = _call_gemini(chunk)
             if out:
                 log.info(f"✅ Gemini OK chunk {idx}")
         except Exception as e:
-            log.warning(f"⚠️ Gemini failed chunk {idx}: {e}")
+            log.warning(f"⚠️ Gemini failed chunk {idx}: {str(e)[:200]}")
 
+        # Groq fallback
         if not out:
             try:
                 log.info(f"→ Groq fallback chunk {idx}")
@@ -210,21 +185,29 @@ def analyze_all_pairs(tf_data_per_symbol):
                 if out:
                     log.info(f"✅ Groq OK chunk {idx}")
             except Exception as e:
-                log.error(f"❌ Groq failed chunk {idx}: {e}")
+                log.error(f"❌ Groq failed chunk {idx}: {str(e)[:200]}")
 
+        # Both fail — HOLD
         if not out:
             for b in chunk:
-                results.append(_fallback_hold(b["symbol"], "AI unavailable",
-                                              _last_price_from_bundle(b)))
+                last_price = 0
+                if b["tf_summary"]:
+                    tfs = list(b["tf_summary"].keys())
+                    last_price = b["tf_summary"][tfs[-1]].get("close", 0)
+                results.append(_fallback_hold(b["symbol"], "AI unavailable", last_price))
         else:
             results.extend(out)
 
-        time.sleep(1.2)
+        time.sleep(2)  # safety
 
+    # Ensure all symbols have results
     got = {r.get("symbol") for r in results}
     for b in bundles:
         if b["symbol"] not in got:
-            results.append(_fallback_hold(b["symbol"], "No AI output",
-                                          _last_price_from_bundle(b)))
+            last_price = 0
+            if b["tf_summary"]:
+                tfs = list(b["tf_summary"].keys())
+                last_price = b["tf_summary"][tfs[-1]].get("close", 0)
+            results.append(_fallback_hold(b["symbol"], "No AI output", last_price))
 
     return results
