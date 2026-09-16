@@ -3,6 +3,7 @@ import os
 
 # ==================== API KEYS ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")   # ⭐ YE ADD KARO
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
@@ -43,9 +44,9 @@ BOT_END_HOUR_UTC   = 20
 WEEKEND_CRYPTO_ONLY = True
 
 # ==================== AI (UPDATED MODELS) ====================
-GEMINI_MODEL      = "gemini-2.5-flash"          # ⭐ new active
-GROQ_MODEL        = "openai/gpt-oss-120b"   # ⭐ new active
-GEMINI_BATCH_SIZE = 10                           # reduce chunks
+GEMINI_MODEL      = "gemini-2.5-flash"
+GROQ_MODEL        = "openai/gpt-oss-120b"
+GEMINI_BATCH_SIZE = 10
 
 # ==================== STRATEGY ====================
 MIN_SCORE_FOR_SIGNAL = 2
