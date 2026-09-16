@@ -22,7 +22,6 @@ def _conn():
 
 
 def bootstrap_env_ids():
-    """Railway env IDs ko DB me daalo (pehli baar)."""
     with _conn() as c:
         for cid in TELEGRAM_CHAT_IDS:
             c.execute(
@@ -34,7 +33,6 @@ def bootstrap_env_ids():
 
 
 def subscribe(chat_id: int, username: str = "") -> bool:
-    """Naya subscriber — auto_signal=ON by default."""
     with _conn() as c:
         c.execute(
             "INSERT OR REPLACE INTO subscribers (chat_id, username, added_at, auto_signal) "
@@ -55,14 +53,12 @@ def unsubscribe(chat_id: int) -> bool:
 
 
 def set_auto_signal(chat_id: int, enabled: bool) -> bool:
-    """Auto signal ON/OFF toggle."""
     with _conn() as c:
         c.execute(
             "UPDATE subscribers SET auto_signal = ? WHERE chat_id = ?",
             (1 if enabled else 0, chat_id),
         )
         c.commit()
-    log.info(f"🔘 auto_signal={enabled} for {chat_id}")
     return True
 
 
@@ -75,7 +71,6 @@ def is_auto_signal_on(chat_id: int) -> bool:
 
 
 def get_signal_subscribers() -> list[int]:
-    """Sirf wo subscribers jinka auto_signal=1 hai."""
     with _conn() as c:
         rows = c.execute(
             "SELECT chat_id FROM subscribers WHERE auto_signal = 1"
