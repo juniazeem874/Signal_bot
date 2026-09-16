@@ -12,6 +12,7 @@ from config import (
     CRYPTO_TFS, FOREX_TFS, METAL_TFS,
     CANDLES_PER_TF,
 )
+from indicators import add_indicators
 
 log = logging.getLogger(__name__)
 
@@ -28,89 +29,17 @@ TF_BYBIT   = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": 
 TF_TD      = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day"}
 TF_YF      = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d"}
 
-_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_CACHE = {}
 CACHE_TTL = 60
 
 
-# ==================== INDICATORS ====================
-def _ema(series, length):
-    return series.ewm(span=length, adjust=False).mean()
+def clear_cache():
+    """Har cycle se pehle cache clear karo — fresh data."""
+    global _CACHE
+    _CACHE.clear()
+    log.info("🧹 Data cache cleared")
 
 
-def _rsi(series, length=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(length).mean()
-    loss = (-delta.clip(upper=0)).rolling(length).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def _atr(df, length=14):
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(length).mean()
-
-
-def _macd(series, fast=12, slow=26, signal=9):
-    ema_fast = _ema(series, fast)
-    ema_slow = _ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = _ema(macd_line, signal)
-    return macd_line, signal_line, macd_line - signal_line
-
-
-def _detect_trend(df):
-    if len(df) < 200:
-        return "NA"
-    last = df.iloc[-1]
-    if pd.isna(last.get("ema20")) or pd.isna(last.get("ema200")):
-        return "NA"
-    if last["ema20"] > last["ema50"] > last["ema200"]:
-        return "up"
-    if last["ema20"] < last["ema50"] < last["ema200"]:
-        return "down"
-    return "sideways"
-
-
-def _detect_bos(df, lookback=20):
-    if len(df) < lookback + 1:
-        return False
-    rh = df["high"].iloc[-lookback:-1].max()
-    rl = df["low"].iloc[-lookback:-1].min()
-    lc = df["close"].iloc[-1]
-    return bool(lc > rh or lc < rl)
-
-
-def _detect_fvg(df):
-    if len(df) < 3:
-        return False
-    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-    return bool(c1["high"] < c3["low"] or c1["low"] > c3["high"])
-
-
-def add_indicators(df):
-    if df is None or df.empty or len(df) < 30:
-        return df
-    df = df.copy()
-    df["ema20"] = _ema(df["close"], 20)
-    df["ema50"] = _ema(df["close"], 50)
-    df["ema200"] = _ema(df["close"], 200)
-    df["rsi"] = _rsi(df["close"], 14)
-    df["atr"] = _atr(df, 14)
-    df["macd"], df["macd_signal"], df["macd_hist"] = _macd(df["close"])
-    df["vol_avg"] = df["volume"].rolling(20).mean()
-    df["vol_spike"] = df["volume"] > 1.5 * df["vol_avg"]
-    df["trend"] = _detect_trend(df)
-    df["bos"] = _detect_bos(df)
-    df["fvg"] = _detect_fvg(df)
-    return df
-
-
-# ==================== CACHE ====================
 def _cache_get(key):
     if key in _CACHE:
         ts, df = _CACHE[key]
@@ -213,7 +142,7 @@ def fetch_bybit(symbol, interval="15m", limit=CANDLES_PER_TF):
         return pd.DataFrame()
 
 
-# ==================== TWELVEDATA ====================
+# ==================== TWELVEDATA (GOLD) ====================
 def fetch_twelvedata(symbol, interval="1h", outputsize=CANDLES_PER_TF):
     if not TWELVEDATA_API_KEY:
         log.error("TWELVEDATA_API_KEY missing")
@@ -239,18 +168,19 @@ def fetch_twelvedata(symbol, interval="1h", outputsize=CANDLES_PER_TF):
         df["datetime"] = pd.to_datetime(df["datetime"])
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        # ⭐ FIX: Volume column missing ho to 0
+        # FIX: Volume column missing ho to 0
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
         else:
             df["volume"] = 0.0
         df = df.rename(columns={"datetime": "time"}).sort_values("time").reset_index(drop=True)
-        df = df[["time", "open", "high", "low", "close", "volume"]]
+        df = df[["time","open","high","low","close","volume"]]
         _cache_set(key, df)
         return df
     except Exception as e:
         log.error(f"TwelveData exception {symbol}: {e}")
         return pd.DataFrame()
+
 
 # ==================== YFINANCE (FOREX) ====================
 def fetch_yfinance(symbol, interval="1h", period="60d"):
@@ -280,7 +210,7 @@ def fetch_yfinance(symbol, interval="1h", period="60d"):
         return pd.DataFrame()
 
 
-# ==================== FOREX FREE FALLBACKS ====================
+# ==================== FOREX FREE FALLBACK ====================
 def fetch_forex_free(symbol, interval="1h", limit=200):
     """frankfurter.app + exchangerate.host fallback."""
     try:
@@ -293,7 +223,7 @@ def fetch_forex_free(symbol, interval="1h", limit=200):
     if cached is not None:
         return cached
 
-    # --- frankfurter.app ---
+    # frankfurter
     try:
         end = pd.Timestamp.utcnow().date()
         start = end - pd.Timedelta(days=90)
@@ -318,7 +248,7 @@ def fetch_forex_free(symbol, interval="1h", limit=200):
     except Exception as e:
         log.warning(f"frankfurter fail {symbol}: {e}")
 
-    # --- exchangerate.host ---
+    # exchangerate.host
     try:
         end = pd.Timestamp.utcnow().date()
         start = end - pd.Timedelta(days=60)
@@ -361,7 +291,7 @@ def fetch_crypto(symbol, interval="15m", limit=CANDLES_PER_TF):
     return df if not df.empty else pd.DataFrame()
 
 
-# ==================== MULTI-TF ====================
+# ==================== MULTI-TF FETCHERS ====================
 def fetch_crypto_multi_tf(symbol):
     out = {}
     for tf in CRYPTO_TFS:
@@ -420,25 +350,8 @@ def fetch_all_pairs_raw():
     return all_data
 
 
-# ==================== LEGACY ====================
-def get_data(symbol):
-    if symbol in CRYPTO_PAIRS:
-        tf_data = fetch_crypto_multi_tf(symbol)
-    elif symbol in FOREX_PAIRS:
-        tf_data = fetch_forex_multi_tf(symbol)
-    elif symbol == GOLD_PAIR:
-        tf_data = fetch_gold_multi_tf()
-    else:
-        return (None, None)
-    if not tf_data:
-        return (None, None)
-    tfs = list(tf_data.keys())
-    return (tf_data[tfs[-1]], tf_data[tfs[0]])
-
-
 # ==================== PRICE HELPERS ====================
-def get_current_price(symbol: str) -> float:
-    """Ek pair ka current last-close price lao — har analysis ke liye."""
+def get_current_price(symbol):
     try:
         if symbol in CRYPTO_PAIRS:
             df = fetch_crypto(symbol, interval="15m", limit=5)
