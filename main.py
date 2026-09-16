@@ -2,13 +2,13 @@
 import asyncio
 import logging
 from datetime import datetime
-
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import AUTO_SCAN_INTERVAL, ALL_PAIRS, BOT_NAME
-from data_fetcher import fetch_all_pairs_raw
-from ai_analyzer import analyze_all_pairs
+from data_fetcher import fetch_all_pairs_raw, clear_cache
+from ai_analyzer import analyze_all_pairs, build_indicator_bundle
 from bot import build_app, send_signal, cleanup_signals
+from data_store import save_market_data, save_signals
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -20,33 +20,53 @@ telegram_app = build_app()
 
 
 async def run_analysis_async():
-    """Ek cycle: cleanup → fetch 19 pairs → AI batch → send signals."""
     try:
         cleanup_signals(telegram_app.bot)
 
-        log.info("🔍 Fetching 19 pairs (crypto + forex + gold)...")
-        raw_data = fetch_all_pairs_raw()
-        log.info(f"📊 Fetched data for {len(raw_data)} pairs")
+        # 1. Clear cache — fresh data
+        clear_cache()
 
-        log.info("🧠 Sending all 19 pairs to AI (batch)...")
-        results = analyze_all_pairs(raw_data)
+        # 2. Fetch 19 pairs (FRESH)
+        log.info(f"🔍 Fetching {len(ALL_PAIRS)} pairs (fresh)...")
+        raw = fetch_all_pairs_raw()
+        log.info(f"📊 Fetched data for {len(raw)} pairs")
+        if not raw:
+            log.error("❌ No data — skipping")
+            return
+
+        # 3. Build bundles with Fibonacci
+        bundles = {}
+        for sym, tf_data in raw.items():
+            b = build_indicator_bundle(sym, tf_data)
+            if b["timeframes"]:
+                bundles[sym] = b
+        log.info(f"📦 Bundles built: {len(bundles)} pairs")
+
+        # 4. Save JSON
+        save_market_data(bundles)
+
+        # 5. AI analysis
+        log.info("🧠 Sending to AI...")
+        results = analyze_all_pairs(raw)
         log.info(f"✅ AI returned {len(results)} signals")
 
+        # 6. Save signals
+        save_signals(results)
+
+        # 7. Send to Telegram
         sent = 0
         for sig in results:
-            if sig.get("signal") == "HOLD":
-                continue   # sirf BUY/SELL bhejo
+            if "AI unavailable" in (sig.get("reason") or ""):
+                continue
             await send_signal(telegram_app, sig)
             sent += 1
-
-        log.info(f"📤 Sent {sent} signals to subscribers")
+        log.info(f"📤 Sent {sent} signals")
 
     except Exception:
         log.exception("❌ Analysis cycle crashed")
 
 
 def scheduled_job():
-    """APScheduler sync wrapper — async cycle ko run karta hai."""
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
@@ -56,22 +76,15 @@ def scheduled_job():
 
 
 def start_scheduler():
-    interval_minutes = AUTO_SCAN_INTERVAL / 60   # 300s → 5 min
-    scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(
-        scheduled_job,
-        "interval",
-        minutes=interval_minutes,        # ⭐ 5 MINUTE
-        id="mj_traders_analysis",
-        max_instances=1,
-        coalesce=True,
-        next_run_time=datetime.utcnow(), # pehla run turant
+    mins = AUTO_SCAN_INTERVAL / 60
+    sch = BackgroundScheduler(timezone="UTC")
+    sch.add_job(
+        scheduled_job, "interval", minutes=mins,
+        id="mj_analysis", max_instances=1, coalesce=True,
+        next_run_time=datetime.utcnow(),
     )
-    scheduler.start()
-    log.info(
-        f"⏰ Scheduler started — every {interval_minutes:.0f} min "
-        f"({AUTO_SCAN_INTERVAL}s)"
-    )
+    sch.start()
+    log.info(f"⏰ Scheduler started — every {mins:.0f} min")
 
 
 def main():
