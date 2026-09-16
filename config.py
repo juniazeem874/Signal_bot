@@ -37,6 +37,12 @@ AUTO_SCAN_ENABLED  = True
 SIGNAL_EXPIRY_HOURS = 6
 SIGNAL_AUTO_DELETE_HOURS = 6
 
+# ==================== SCHEDULE (PKT = UTC + 5) ====================
+# Bot timing (UTC hours for scheduler)
+BOT_START_HOUR_UTC = 3           # 8 AM PKT
+BOT_END_HOUR_UTC   = 20          # 2 AM PKT (next day)
+WEEKEND_CRYPTO_ONLY = True       # Sat/Sun — sirf crypto
+
 # ==================== AI ====================
 GEMINI_MODEL      = "gemini-flash-latest"
 GROQ_MODEL        = "llama-3.1-8b-instant"
