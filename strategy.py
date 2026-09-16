@@ -1,115 +1,92 @@
-import config
-import indicators as ind
-import ai_analyzer
-import news_fetcher
-import data_fetcher
+# strategy.py
+import pandas as pd
+from indicators import add_indicators
+from config import (
+    MIN_SCORE_FOR_SIGNAL, SL_MULTIPLIERS, TP_MULTIPLIERS,
+    SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER,
+)
 
 
-async def analyze(entry_df, trend_df, symbol="UNKNOWN"):
-    entry_df = ind.add_atr(entry_df, period=getattr(config, "ATR_PERIOD", 14))
-    entry_df = ind.add_volume_sma(entry_df, period=20)
+def _agreement(tf_dfs: dict) -> str:
+    """Higher TFs ka direction consensus."""
+    trends = [df["trend"].iloc[-1] for df in tf_dfs.values() if not df.empty and "trend" in df.columns]
+    if not trends:
+        return "NA"
+    if all(t == "up" for t in trends):
+        return "up"
+    if all(t == "down" for t in trends):
+        return "down"
+    return "mixed"
 
-    htf_bias = ind.get_htf_bias(trend_df)
-    marubozu = ind.detect_marubozu(entry_df)
-    engulfing = ind.detect_engulfing(entry_df)
-    fakeout = ind.detect_fake_breakout(entry_df)
-    rejection = ind.detect_rejection_candle(entry_df)
-    fvg = ind.detect_fvg(entry_df)
 
-    swing_high, swing_low = ind.find_last_swing(entry_df)
-    candle_close_price = entry_df.iloc[-1]["close"]
-    last_price = candle_close_price
-    latest_atr = entry_df.iloc[-1]["atr"] if "atr" in entry_df.columns else (last_price * 0.001)
+def _confluence_score(last: pd.Series) -> int:
+    """BOS + FVG + Volume spike — 3 checks."""
+    score = 0
+    if bool(last.get("bos", False)):        score += 1
+    if bool(last.get("fvg", False)):        score += 1
+    if bool(last.get("vol_spike", False)):  score += 1
+    return score
 
-    # Candle-close price from TwelveData/Yahoo free-tier feeds can lag the
-    # real market by a few minutes — pull a live spot quote for metals so the
-    # displayed price matches what you'd see on a broker/market chart. We
-    # rebase swing_high/swing_low by the same offset so the AI sees a
-    # self-consistent picture instead of a live price that contradicts
-    # stale-candle swing levels (which was making gold/silver setups look
-    # broken and default to HOLD almost every time).
-    symbol_upper = symbol.upper()
-    live_price = None
-    if symbol_upper in ("XAU/USD", "XAUUSD", "GOLD"):
-        live_price = data_fetcher.fetch_goldapi_price("XAU")
-    elif symbol_upper in ("XAG/USD", "XAGUSD", "SILVER"):
-        live_price = data_fetcher.fetch_goldapi_price("XAG")
 
-    if live_price:
-        offset = live_price - candle_close_price
-        last_price = live_price
-        if swing_high is not None:
-            swing_high += offset
-        if swing_low is not None:
-            swing_low += offset
+def compute_signal(symbol: str, tf_data: dict) -> dict:
+    """
+    tf_data = {"4h": df, "1h": df, "15m": df, ...}
+    Returns signal dict — but AI overrides this later.
+    """
+    # Add indicators to each TF
+    tf_dfs = {}
+    for tf, df in tf_data.items():
+        if df is None or df.empty:
+            continue
+        tf_dfs[tf] = add_indicators(df)
 
-    exness_buffer = config.EXNESS_SPREAD_BUFFERS.get(symbol, 0.0002)
+    if not tf_dfs:
+        return _hold(symbol, "No data")
 
-    news_data = news_fetcher.get_economic_news(symbol)
+    direction = _agreement(tf_dfs)
+    if direction == "mixed" or direction == "NA":
+        return _hold(symbol, "HTF trend conflict")
 
-    patterns = []
-    if marubozu != "none": patterns.append(marubozu)
-    if engulfing != "none": patterns.append(engulfing)
-    if fakeout != "none": patterns.append(fakeout)
-    if rejection != "none": patterns.append(rejection)
-    if fvg != "none": patterns.append(fvg)
+    # Lowest TF = entry TF
+    entry_tf = list(tf_dfs.keys())[-1]
+    last = tf_dfs[entry_tf].iloc[-1]
 
-    market_summary = {
-        "last_price": last_price,
-        "htf_bias": htf_bias,
-        "patterns": patterns if patterns else ["None"],
-        "volume_status": "High Volume Surge (> 20 SMA)" if ind.has_above_avg_volume(entry_df, period=20) else "Normal",
-        "swing_high": swing_high,
-        "swing_low": swing_low,
-        "atr": latest_atr,
-        "exness_buffer": exness_buffer,
-        "news_data": news_data
-    }
+    score = _confluence_score(last)
+    if score < MIN_SCORE_FOR_SIGNAL:
+        return _hold(symbol, f"Confluence {score}/3")
 
-    ai_result = await ai_analyzer.analyze_market_with_ai(symbol, market_summary)
+    atr_val = float(last.get("atr", 0) or 0)
+    if atr_val <= 0:
+        return _hold(symbol, "ATR=0")
 
-    if ai_result and "signal" in ai_result:
-        signal = ai_result.get("signal", "HOLD").upper()
-        raw_sl = ai_result.get("stop_loss")
+    close = float(last["close"])
+    sl_mult = SL_MULTIPLIERS.get(symbol, SL_ATR_MULTIPLIER)
+    tp_mult = TP_MULTIPLIERS.get(symbol, TP_ATR_MULTIPLIER)
 
-        # Adjust SL with Exness Buffer Padding
-        if signal == "BUY" and raw_sl:
-            raw_sl -= exness_buffer
-        elif signal == "SELL" and raw_sl:
-            raw_sl += exness_buffer
-
-        take_profits = None
-        if raw_sl and signal in ("BUY", "SELL"):
-            risk = abs(last_price - raw_sl)
-            decimals = 2 if last_price >= 100 else (4 if last_price >= 1 else 6)
-            direction = 1 if signal == "BUY" else -1
-            take_profits = {
-                "tp1": round(last_price + direction * risk * 1, decimals),
-                "tp2": round(last_price + direction * risk * 2, decimals),
-                "tp3": round(last_price + direction * risk * 3, decimals),
-            }
-            raw_sl = round(raw_sl, decimals)
-
-        return {
-            "price": last_price,
-            "trend_bias": htf_bias,
-            "signal": signal,
-            "confidence": ai_result.get("confidence", 85),
-            "reasons": ai_result.get("reasons", []),
-            "stop_loss": raw_sl,
-            "take_profits": take_profits,
-            "rr_ratio": "1:1 / 1:2 / 1:3 (TP1/TP2/TP3)",
-            "market_summary": market_summary
-        }
+    if direction == "up":
+        signal = "BUY"
+        sl = close - sl_mult * atr_val
+        tp = close + tp_mult * atr_val
+    else:
+        signal = "SELL"
+        sl = close + sl_mult * atr_val
+        tp = close - tp_mult * atr_val
 
     return {
-        "price": last_price,
-        "trend_bias": htf_bias,
-        "signal": "HOLD",
-        "confidence": 0,
-        "reasons": ["Awaiting high-probability Exness confluence setup."],
-        "stop_loss": None,
-        "take_profits": None,
-        "rr_ratio": None,
-        "market_summary": market_summary
+        "symbol": symbol,
+        "signal": signal,
+        "confidence": int(60 + score * 10),
+        "reason": f"HTF {direction}, confluence {score}/3",
+        "entry": round(close, 5),
+        "stop_loss": round(sl, 5),
+        "take_profit": round(tp, 5),
+        "top_indicators": ["BOS", "FVG", "Volume"],
+    }
+
+
+def _hold(symbol: str, reason: str) -> dict:
+    return {
+        "symbol": symbol, "signal": "HOLD", "confidence": 0,
+        "reason": reason, "entry": 0, "stop_loss": 0,
+        "take_profit": 0, "top_indicators": [],
     }
