@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 BRAND = "MJ TRADERS"
 
-BACK_LABEL    = "⬅️ Back"
-STATUS_LABEL  = "📊 Status"
-AUTO_ON_LABEL = "🟢 Auto ON"
+BACK_LABEL     = "⬅️ Back"
+STATUS_LABEL   = "📊 Status"
+AUTO_ON_LABEL  = "🟢 Auto ON"
 AUTO_OFF_LABEL = "🔴 Auto OFF"
 
 CATEGORIES = {
@@ -139,19 +139,68 @@ def _category_of(symbol):
     return "crypto"
 
 
-# ==================== SIGNAL FORMAT ====================
+# ==================== ⭐ SMART PRICE FORMATTER (FIX) ====================
+def _fmt_price(value) -> str:
+    """
+    Price ki magnitude ke hisaab se smart precision.
+    DOGE/SHIB jaise chhote coins: 5-8 decimals.
+    BTC/gold jaise bade: 2-3 decimals.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if v == 0:
+        return "0"
+    abs_v = abs(v)
+    if abs_v >= 1000:      # BTC, gold
+        return f"{v:.2f}"
+    elif abs_v >= 100:     # ETH, SOL, XAU
+        return f"{v:.3f}"
+    elif abs_v >= 1:       # XRP, ADA, LINK
+        return f"{v:.4f}"
+    elif abs_v >= 0.01:    # DOGE, small caps
+        return f"{v:.5f}"
+    else:                  # micro caps (SHIB, PEPE etc)
+        return f"{v:.8f}"
+
+
+# ==================== TP CALCULATOR ====================
 def _calc_tps(sig):
+    """
+    SL/TP nikaalo. entry aur SL se risk nikalo,
+    phir 1:1, 1:2, 1:3 targets banao.
+    """
     entry = float(sig.get("entry", 0) or 0)
     sl = float(sig.get("stop_loss", 0) or 0)
     action = sig.get("signal", "HOLD")
-    if entry <= 0 or sl <= 0 or action == "HOLD" or entry == sl:
+
+    # HOLD ya invalid — TP nahi
+    if entry <= 0 or action == "HOLD" or entry == sl:
         return (0, 0, 0, sl)
+
+    # Agar AI ne SL nahi diya, to ATR-based default
+    if sl <= 0:
+        atr = float(sig.get("atr", 0) or 0)
+        if atr <= 0:
+            # Last resort: 0.5% risk
+            atr = entry * 0.005
+        if action == "BUY":
+            sl = entry - atr * 1.5
+        else:
+            sl = entry + atr * 1.5
+
     risk = abs(entry - sl)
+    if risk <= 0:
+        return (0, 0, 0, sl)
+
     if action == "BUY":
         return (entry + risk, entry + risk * 2, entry + risk * 3, sl)
-    return (entry - risk, entry - risk * 2, entry - risk * 3, sl)
+    else:  # SELL
+        return (entry - risk, entry - risk * 2, entry - risk * 3, sl)
 
 
+# ==================== REASONS FORMATTER ====================
 def _format_reasons(sig):
     raw = (sig.get("reason") or "").strip()
     if " • " in raw:
@@ -168,8 +217,9 @@ def _format_reasons(sig):
     return "\n".join(out)
 
 
+# ==================== PRICE GUARANTEE ====================
 def _ensure_price(sig):
-    """AI ne entry 0 di to bot khud market price le aaye."""
+    """AI ne entry 0 di to market se current price le aao."""
     entry = float(sig.get("entry", 0) or 0)
     if entry > 0:
         return sig
@@ -180,10 +230,12 @@ def _ensure_price(sig):
     return sig
 
 
+# ==================== SIGNAL FORMAT (MJ TRADERS) ====================
 def format_signal(sig):
-    sig = _ensure_price(sig)   # ⭐ price guarantee
+    sig = _ensure_price(sig)
     action = sig.get("signal", "HOLD")
     emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(action, "⚪")
+
     entry = float(sig.get("entry", 0) or 0)
     tp1, tp2, tp3, sl = _calc_tps(sig)
     reasons = _format_reasons(sig)
@@ -193,15 +245,18 @@ def format_signal(sig):
         "",
         f"Pair: *{sig.get('symbol', '?')}*",
         f"Action: *{action}*",
-        f"Price: `{entry}`",
+        f"Price: `{_fmt_price(entry)}`",
     ]
-    if action != "HOLD" and tp1 > 0:
+
+    # BUY/SELL me TP/SL dikhao
+    if action != "HOLD" and tp1 > 0 and sl > 0:
         lines += [
-            f"TP1 (1:1): `{round(tp1, 2)}`",
-            f"TP2 (1:2): `{round(tp2, 2)}`",
-            f"TP3 (1:3): `{round(tp3, 2)}`",
-            f"Stop Loss (SL): `{round(sl, 2)}`",
+            f"TP1 (1:1): `{_fmt_price(tp1)}`",
+            f"TP2 (1:2): `{_fmt_price(tp2)}`",
+            f"TP3 (1:3): `{_fmt_price(tp3)}`",
+            f"Stop Loss (SL): `{_fmt_price(sl)}`",
         ]
+
     lines += [
         f"Confidence: {sig.get('confidence', 0)}%",
         "",
@@ -243,7 +298,7 @@ async def send_signal(application, sig, chat_id_override=None):
         logger.info(f"✅ {sig['symbol']} {sig['signal']} → {len(sent_to)} chats")
 
 
-# ==================== CLEANUP ====================
+# ==================== CLEANUP (6h) ====================
 def cleanup_signals(bot):
     now = datetime.utcnow()
     to_remove = [s for s, v in list(ACTIVE_SIGNALS.items())
@@ -256,10 +311,10 @@ def cleanup_signals(bot):
                 logger.warning(f"delete fail {sym}@{cid}: {e}")
         del ACTIVE_SIGNALS[sym]
     if to_remove:
-        logger.info(f"🧹 Cleaned {len(to_remove)} signals")
+        logger.info(f"🧹 Cleaned {len(to_remove)} signals (> {SIGNAL_EXPIRY_HOURS}h)")
 
 
-# ==================== MANUAL ANALYSIS ====================
+# ==================== MANUAL ANALYSIS (button click) ====================
 async def _run_analysis(symbol):
     try:
         if symbol in CRYPTO_PAIRS:
@@ -318,7 +373,7 @@ async def send_welcome(update, context):
         f"🤖 *{BRAND}*\n"
         f"Trading Signal Bot\n\n"
         f"Auto-scanning every `{AUTO_SCAN_INTERVAL // 60} min` across `{len(ALL_PAIRS_SET)}` pairs — "
-        f"BUY/SELL alerts automatically aayenge.\n\n"
+        f"BUY/SELL/HOLD alerts automatically aayenge.\n\n"
         "👇 Neeche menu se category chunein, phir pair pe tap karein."
     )
     await safe_reply(update, context, msg, reply_markup=get_main_keyboard(True), track_nav=True)
