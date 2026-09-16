@@ -15,7 +15,7 @@ TELEGRAM_CHAT_IDS = [
 TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
 
 # ==================== BOT BRANDING ====================
-BOT_NAME = "MJ TRADING"
+BOT_NAME = "MJ TRADERS"
 BOT_TAGLINE = "Trading Signal Bot"
 
 # ==================== PAIRS ====================
@@ -33,14 +33,11 @@ ALL_PAIRS = CRYPTO_PAIRS + FOREX_PAIRS + [GOLD_PAIR]
 
 # ==================== SYMBOL ALIASES ====================
 SYMBOL_ALIASES = {
-    # Gold
     "XAUUSD": "XAU/USD", "GOLD": "XAU/USD", "XAU": "XAU/USD",
-    # Crypto USD → USDT
     "BTCUSD": "BTCUSDT", "ETHUSD": "ETHUSDT", "SOLUSD": "SOLUSDT",
     "BNBUSD": "BNBUSDT", "XRPUSD": "XRPUSDT", "ADAUSD": "ADAUSDT",
     "DOGEUSD": "DOGEUSDT", "AVAXUSD": "AVAXUSDT",
     "MATICUSD": "MATICUSDT", "LINKUSD": "LINKUSDT",
-    # Forex no-slash
     "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY",
     "AUDUSD": "AUD/USD", "USDCAD": "USD/CAD", "NZDUSD": "NZD/USD",
     "USDCHF": "USD/CHF", "EURGBP": "EUR/GBP",
@@ -48,7 +45,6 @@ SYMBOL_ALIASES = {
 
 
 def normalize_symbol(sym: str) -> str:
-    """User input → internal symbol."""
     if not sym:
         return ""
     s = sym.upper().strip().replace(" ", "")
@@ -66,9 +62,9 @@ def normalize_symbol(sym: str) -> str:
 CRYPTO_TFS = ["4h", "1h", "15m", "5m", "1m"]
 FOREX_TFS  = ["4h", "1h", "15m"]
 
-# ==================== SCHEDULER ====================
-ANALYSIS_INTERVAL_MINUTES = 60
-SIGNAL_EXPIRY_HOURS       = 6
+# ==================== SCHEDULER — 5 MINUTE ====================
+ANALYSIS_INTERVAL_MINUTES = 5      # ⭐ har 5 minute
+SIGNAL_EXPIRY_HOURS       = 6      # 6h baad delete
 
 # ==================== AI ====================
 GEMINI_MODEL      = "gemini-1.5-flash"
@@ -87,6 +83,3 @@ TP_MULTIPLIERS = {
     "BTCUSDT": 3.0, "ETHUSDT": 3.0, "SOLUSDT": 3.5,
     "XAU/USD": 2.5, "EUR/USD": 2.0, "GBP/USD": 2.0, "USD/JPY": 2.0,
 }
-
-# ==================== DB ====================
-SUBSCRIBERS_DB = "subscribers.db"
