@@ -2,30 +2,51 @@
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes,
+    MessageHandler, filters, ContextTypes,
 )
 from config import (
-    TELEGRAM_BOT_TOKEN, SIGNAL_EXPIRY_HOURS,
-    BOT_NAME, BOT_TAGLINE,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, SIGNAL_EXPIRY_HOURS,
+    BOT_NAME, BOT_TAGLINE, ANALYSIS_INTERVAL_MINUTES,
     CRYPTO_PAIRS, FOREX_PAIRS, GOLD_PAIR,
     normalize_symbol,
-    ANALYSIS_INTERVAL_MINUTES,
 )
-from subscribers import (
-    bootstrap_env_ids, subscribe, unsubscribe,
-    set_auto_signal, is_auto_signal_on,
-    get_signal_subscribers, get_all_subscribers,
-    count_subscribers,
+from data_fetcher import (
+    fetch_crypto_multi_tf, fetch_forex_multi_tf, fetch_gold_multi_tf,
 )
+from ai_analyzer import analyze_all_pairs
 
 log = logging.getLogger(__name__)
 
-bootstrap_env_ids()
-
+# ACTIVE_SIGNALS: {symbol: {"msg_ids": {chat_id: msg_id}, ...}}
 ACTIVE_SIGNALS: dict[str, dict] = {}
+
+# ================= REPLY KEYBOARD (Neeche wale buttons) =================
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Neeche wala menu — BTCUSDT, ETHUSDT, etc.
+    Ye Telegram ke native bottom keyboard me dikhega.
+    """
+    rows = []
+    # Crypto pairs — 2 per row
+    crypto = CRYPTO_PAIRS[:8]   # BTC, ETH, SOL, BNB, XRP, ADA, DOGE, AVAX
+    for i in range(0, len(crypto), 2):
+        row = [KeyboardButton(crypto[i])]
+        if i + 1 < len(crypto):
+            row.append(KeyboardButton(crypto[i + 1]))
+        rows.append(row)
+    # Gold + DOGE extra
+    rows.append([KeyboardButton("XAUUSD"), KeyboardButton("DOGEUSDT")])
+    rows.append([KeyboardButton("⬅️ Back")])
+    return ReplyKeyboardMarkup(
+        rows, resize_keyboard=True, one_time_keyboard=False,
+        input_field_placeholder="Pair select karo...",
+    )
 
 
 def save_signal(symbol: str, sig: dict, msg_ids: dict, chat_ids: list):
@@ -78,16 +99,12 @@ def _calc_tps(sig: dict) -> tuple:
 # ================= REASON FORMATTER =================
 def _format_reasons(sig: dict) -> str:
     raw = (sig.get("reason") or "").strip()
-
-    # AI se " • " separated aata hai
     if " • " in raw:
         parts = [p.strip() for p in raw.split(" • ") if p.strip()]
     else:
         parts = [p.strip() for p in raw.replace(";", ".").split(".") if p.strip()]
-
     if not parts:
         return "• No detailed reason available."
-
     out = []
     for p in parts[:3]:
         if not p.endswith("."):
@@ -96,7 +113,7 @@ def _format_reasons(sig: dict) -> str:
     return "\n".join(out)
 
 
-# ================= SIGNAL FORMAT =================
+# ================= SIGNAL FORMAT (MJ TRADERS STYLE) =================
 def format_signal(sig: dict) -> str:
     action = sig.get("signal", "HOLD")
     emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(action, "⚪")
@@ -129,15 +146,12 @@ def format_signal(sig: dict) -> str:
     return "\n".join(lines)
 
 
-# ================= SEND =================
+# ================= SEND SIGNAL =================
 async def send_signal(application, sig: dict, chat_id_override: int = None):
-    if chat_id_override:
-        chat_ids = [chat_id_override]
-    else:
-        chat_ids = get_signal_subscribers()
-
+    """Signal bhejo sab registered chats ko."""
+    chat_ids = [chat_id_override] if chat_id_override else TELEGRAM_CHAT_IDS
     if not chat_ids:
-        log.warning("No auto-signal subscribers")
+        log.error("No chat IDs configured")
         return
 
     text = format_signal(sig)
@@ -161,99 +175,63 @@ async def send_signal(application, sig: dict, chat_id_override: int = None):
         log.info(f"✅ {sig['symbol']} {sig['signal']} → {len(sent_to)} chats")
 
 
-# ================= /start =================
+# ================= /start — Sirf Keyboard Dikhao =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    is_sub = cid in get_all_subscribers()
-
-    if is_sub:
-        auto_on = is_auto_signal_on(cid)
-        kb = [
-            [InlineKeyboardButton(
-                "🔴 Auto Signal OFF" if auto_on else "🟢 Auto Signal ON",
-                callback_data="toggle_auto",
-            )],
-            [InlineKeyboardButton("❌ Unsubscribe", callback_data="unsubscribe")],
-        ]
-        status = "🟢 ON" if auto_on else "🔴 OFF"
-        await update.message.reply_text(
-            f"🤖 *{BOT_NAME}* — {BOT_TAGLINE}\n\n"
-            f"Aap subscribed ho ✅\n"
-            f"Auto Signal: *{status}*\n"
-            f"Interval: every {ANALYSIS_INTERVAL_MINUTES} min\n"
-            f"Pairs: {len(CRYPTO_PAIRS) + len(FOREX_PAIRS) + 1}\n\n"
-            f"Tap button below to toggle.",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown",
-        )
-    else:
-        kb = [[InlineKeyboardButton("✅ Subscribe", callback_data="subscribe")]]
-        await update.message.reply_text(
-            f"🤖 *{BOT_NAME}*\n"
-            f"_{BOT_TAGLINE}_\n\n"
-            f"Auto-scanning *{len(CRYPTO_PAIRS) + len(FOREX_PAIRS) + 1}* pairs "
-            f"every *{ANALYSIS_INTERVAL_MINUTES} min*.\n\n"
-            f"BUY/SELL alerts — confidence, TP1/TP2/TP3, SL aur detailed reasons ke saath.\n\n"
-            f"👉 Subscribe karo signals pane ke liye 👇",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown",
-        )
+    """
+    /start pe koi welcome text nahi — sirf neeche wala keyboard.
+    """
+    await update.message.reply_text(
+        "⌨️",
+        reply_markup=get_main_keyboard(),
+    )
 
 
-# ================= BUTTONS =================
-async def button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    cid = q.message.chat.id
-    uname = q.from_user.username or q.from_user.first_name or ""
+# ================= PAIR CLICK HANDLER =================
+async def pair_click_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Jab user neeche wale keyboard se koi pair click kare,
+    to us pair ka analysis fetch karo aur signal bhejo.
+    """
+    text = update.message.text.strip()
+    if text == "⬅️ Back":
+        # Back pe keyboard wapas dikhao
+        await update.message.reply_text("⌨️", reply_markup=get_main_keyboard())
+        return
 
-    if data == "subscribe":
-        subscribe(cid, uname)
-        kb = [
-            [InlineKeyboardButton("🔴 Auto Signal OFF", callback_data="toggle_auto")],
-            [InlineKeyboardButton("❌ Unsubscribe", callback_data="unsubscribe")],
-        ]
-        await q.edit_message_text(
-            f"✅ *Subscribed to {BOT_NAME}!*\n\n"
-            f"Auto Signal: *🟢 ON*\n"
-            f"Ab signals automatically aayenge — every {ANALYSIS_INTERVAL_MINUTES} min.",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown",
-        )
-    elif data == "unsubscribe":
-        unsubscribe(cid)
-        kb = [[InlineKeyboardButton("✅ Subscribe", callback_data="subscribe")]]
-        await q.edit_message_text(
-            f"❌ *Unsubscribed*\n\n"
-            f"Signals band. Wapas subscribe karne ke liye tap karo.",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown",
-        )
-    elif data == "toggle_auto":
-        current = is_auto_signal_on(cid)
-        new_state = not current
-        set_auto_signal(cid, new_state)
-        kb = [
-            [InlineKeyboardButton(
-                "🔴 Auto Signal OFF" if new_state else "🟢 Auto Signal ON",
-                callback_data="toggle_auto",
-            )],
-            [InlineKeyboardButton("❌ Unsubscribe", callback_data="unsubscribe")],
-        ]
-        status = "🟢 ON" if new_state else "🔴 OFF"
-        await q.edit_message_text(
-            f"🤖 *{BOT_NAME}*\n\n"
-            f"Auto Signal: *{status}*\n\n"
-            f"{'Signals aayenge ✅' if new_state else 'Signals band 🚫'}",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown",
-        )
+    sym = normalize_symbol(text)
+    if sym not in CRYPTO_PAIRS + FOREX_PAIRS + [GOLD_PAIR]:
+        # Unknown text — kuch mat karo
+        return
+
+    await update.message.reply_text(f"⏳ Fetching {sym}...")
+
+    try:
+        if sym in CRYPTO_PAIRS:
+            tf_data = fetch_crypto_multi_tf(sym)
+        elif sym in FOREX_PAIRS:
+            tf_data = fetch_forex_multi_tf(sym)
+        elif sym == GOLD_PAIR:
+            tf_data = fetch_gold_multi_tf()
+        else:
+            return
+
+        results = analyze_all_pairs({sym: tf_data})
+        if results:
+            await update.message.reply_text(
+                format_signal(results[0]), parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"❌ No signal for {sym}")
+    except Exception as e:
+        log.exception(f"pair_click {sym} failed: {e}")
+        await update.message.reply_text(f"❌ Error analyzing {sym}")
 
 
 # ================= BUILD =================
 def build_application() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_cb))
+    app.add_handler(CallbackQueryHandler(lambda u, c: None))   # placeholder
+    # Sirf text messages handle karo (pair clicks)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pair_click_handler))
     return app
