@@ -41,7 +41,7 @@ ALL_PAIRS_SET = {p for _l, pairs in CATEGORIES.values() for p in pairs}
 
 DEFAULT_AUTO_ENABLED = getattr(config, "AUTO_SCAN_ENABLED", True)
 
-ACTIVE_SIGNALS: dict[str, dict] = {}
+ACTIVE_SIGNALS = {}
 
 
 def _get_auto_enabled(bot_data, chat_id):
@@ -63,8 +63,8 @@ async def _delete_message_job(context):
     d = context.job.data
     try:
         await context.bot.delete_message(chat_id=d["chat_id"], message_id=d["message_id"])
-    except Exception as e:
-        logger.warning(f"auto-delete fail: {e}")
+    except Exception:
+        pass
 
 
 def _schedule_auto_delete(context, chat_id, message_id, hours):
@@ -94,7 +94,7 @@ async def safe_reply(update, context, text, reply_markup=None, track_nav=False,
     try:
         sent = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
     except Exception as e:
-        logger.error(f"Markdown reply fail, retry plain: {e}")
+        logger.error(f"Markdown reply fail: {e}")
         sent = await update.message.reply_text(_strip_markdown(text), reply_markup=reply_markup)
     if track_nav:
         context.application.bot_data.setdefault("nav_msg", {})[chat_id] = sent.message_id
@@ -109,8 +109,8 @@ async def _delete_incoming(update, context):
         return
     try:
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
-    except Exception as e:
-        logger.debug(f"incoming delete skip: {e}")
+    except Exception:
+        pass
 
 
 # ==================== KEYBOARDS ====================
@@ -139,13 +139,8 @@ def _category_of(symbol):
     return "crypto"
 
 
-# ==================== ⭐ SMART PRICE FORMATTER (FIX) ====================
-def _fmt_price(value) -> str:
-    """
-    Price ki magnitude ke hisaab se smart precision.
-    DOGE/SHIB jaise chhote coins: 5-8 decimals.
-    BTC/gold jaise bade: 2-3 decimals.
-    """
+# ==================== SMART PRICE FORMAT ====================
+def _fmt_price(value):
     try:
         v = float(value)
     except (TypeError, ValueError):
@@ -153,42 +148,32 @@ def _fmt_price(value) -> str:
     if v == 0:
         return "0"
     abs_v = abs(v)
-    if abs_v >= 1000:      # BTC, gold
+    if abs_v >= 1000:
         return f"{v:.2f}"
-    elif abs_v >= 100:     # ETH, SOL, XAU
+    elif abs_v >= 100:
         return f"{v:.3f}"
-    elif abs_v >= 1:       # XRP, ADA, LINK
+    elif abs_v >= 1:
         return f"{v:.4f}"
-    elif abs_v >= 0.01:    # DOGE, small caps
+    elif abs_v >= 0.01:
         return f"{v:.5f}"
-    else:                  # micro caps (SHIB, PEPE etc)
+    else:
         return f"{v:.8f}"
 
 
 # ==================== TP CALCULATOR ====================
 def _calc_tps(sig):
-    """
-    SL/TP nikaalo. entry aur SL se risk nikalo,
-    phir 1:1, 1:2, 1:3 targets banao.
-    """
     entry = float(sig.get("entry", 0) or 0)
     sl = float(sig.get("stop_loss", 0) or 0)
     action = sig.get("signal", "HOLD")
 
-    # HOLD ya invalid — TP nahi
     if entry <= 0 or action == "HOLD" or entry == sl:
         return (0, 0, 0, sl)
 
-    # Agar AI ne SL nahi diya, to ATR-based default
     if sl <= 0:
         atr = float(sig.get("atr", 0) or 0)
         if atr <= 0:
-            # Last resort: 0.5% risk
             atr = entry * 0.005
-        if action == "BUY":
-            sl = entry - atr * 1.5
-        else:
-            sl = entry + atr * 1.5
+        sl = entry - atr * 1.5 if action == "BUY" else entry + atr * 1.5
 
     risk = abs(entry - sl)
     if risk <= 0:
@@ -196,11 +181,10 @@ def _calc_tps(sig):
 
     if action == "BUY":
         return (entry + risk, entry + risk * 2, entry + risk * 3, sl)
-    else:  # SELL
+    else:
         return (entry - risk, entry - risk * 2, entry - risk * 3, sl)
 
 
-# ==================== REASONS FORMATTER ====================
 def _format_reasons(sig):
     raw = (sig.get("reason") or "").strip()
     if " • " in raw:
@@ -217,9 +201,7 @@ def _format_reasons(sig):
     return "\n".join(out)
 
 
-# ==================== PRICE GUARANTEE ====================
 def _ensure_price(sig):
-    """AI ne entry 0 di to market se current price le aao."""
     entry = float(sig.get("entry", 0) or 0)
     if entry > 0:
         return sig
@@ -230,12 +212,10 @@ def _ensure_price(sig):
     return sig
 
 
-# ==================== SIGNAL FORMAT (MJ TRADERS) ====================
 def format_signal(sig):
     sig = _ensure_price(sig)
     action = sig.get("signal", "HOLD")
     emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(action, "⚪")
-
     entry = float(sig.get("entry", 0) or 0)
     tp1, tp2, tp3, sl = _calc_tps(sig)
     reasons = _format_reasons(sig)
@@ -248,7 +228,6 @@ def format_signal(sig):
         f"Price: `{_fmt_price(entry)}`",
     ]
 
-    # BUY/SELL me TP/SL dikhao
     if action != "HOLD" and tp1 > 0 and sl > 0:
         lines += [
             f"TP1 (1:1): `{_fmt_price(tp1)}`",
@@ -263,6 +242,11 @@ def format_signal(sig):
         "*Reasons (why this trade):*",
         reasons,
     ]
+
+    fib_note = sig.get("fib_analysis")
+    if fib_note and action != "HOLD":
+        lines.append(f"\n📐 *Fib:* {fib_note}")
+
     return "\n".join(lines)
 
 
@@ -298,7 +282,7 @@ async def send_signal(application, sig, chat_id_override=None):
         logger.info(f"✅ {sig['symbol']} {sig['signal']} → {len(sent_to)} chats")
 
 
-# ==================== CLEANUP (6h) ====================
+# ==================== CLEANUP ====================
 def cleanup_signals(bot):
     now = datetime.utcnow()
     to_remove = [s for s, v in list(ACTIVE_SIGNALS.items())
@@ -307,14 +291,14 @@ def cleanup_signals(bot):
         for cid, mid in ACTIVE_SIGNALS[sym].get("msg_ids", {}).items():
             try:
                 bot.delete_message(chat_id=cid, message_id=mid)
-            except Exception as e:
-                logger.warning(f"delete fail {sym}@{cid}: {e}")
+            except Exception:
+                pass
         del ACTIVE_SIGNALS[sym]
     if to_remove:
-        logger.info(f"🧹 Cleaned {len(to_remove)} signals (> {SIGNAL_EXPIRY_HOURS}h)")
+        logger.info(f"🧹 Cleaned {len(to_remove)} signals")
 
 
-# ==================== MANUAL ANALYSIS (button click) ====================
+# ==================== MANUAL ANALYSIS ====================
 async def _run_analysis(symbol):
     try:
         if symbol in CRYPTO_PAIRS:
