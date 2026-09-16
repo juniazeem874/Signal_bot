@@ -44,7 +44,7 @@ WEEKEND_CRYPTO_ONLY = True
 
 # ==================== AI (UPDATED MODELS) ====================
 GEMINI_MODEL      = "gemini-2.5-flash"          # ⭐ new active
-GROQ_MODEL        = "llama-3.3-70b-versatile"   # ⭐ new active
+GROQ_MODEL        = "openai/gpt-oss-120b"   # ⭐ new active
 GEMINI_BATCH_SIZE = 10                           # reduce chunks
 
 # ==================== STRATEGY ====================
