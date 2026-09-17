@@ -22,35 +22,81 @@ else:
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-# ==================== PROMPT ====================
+# ==================== SYSTEM PROMPT (with Learning) ====================
 SYSTEM_PROMPT = f"""You are a professional multi-asset trading analyst for {BOT_NAME} signals channel.
 
 You will receive:
-1. READY_PAIRS — new trade setups (pre-filtered by strategy)
-2. RECENT_OUTCOMES — what happened to previous signals (TP_HIT/SL_HIT/REVERSAL)
+1. READY_PAIRS — new trade setups (pre-filtered by strategy) with score, direction_hint, reasons, tf_summary
+2. RECENT_OUTCOMES — what happened to previous signals:
+   - TP_HIT: worked (check original_confidence and tp_level)
+   - SL_HIT: failed (check original_confidence, original_reason, current_price)
+   - REVERSAL: invalidated (check original_confidence, current_price)
+   - RUNNING: still open
 
-For each READY PAIR, return JSON object with EXACT keys:
-  symbol         : string
+═══════════════════════════════════════════════════════
+For EACH ready pair return a JSON object with EXACT keys:
+═══════════════════════════════════════════════════════
+  symbol         : string (same as input)
   signal         : "BUY" | "SELL" | "HOLD"
   confidence     : integer 0-100
   entry          : number (current price from smallest TF close) — NEVER 0
-  stop_loss      : number (ATR-based or beyond nearest Fib level)
-  take_profit    : number (1:2 minimum risk-reward)
-  reason         : string with 3 sentences separated by " • "
-  fib_analysis   : string — how Fibonacci influences this trade
-  smc_analysis   : string — BOS/FVG confluence note
-  top_indicators : array of 3 strings
+  stop_loss      : number (ATR-based or beyond nearest Fib level) — MUST be different from entry
+  take_profit    : number (1:2 minimum risk-reward) — MUST be different from entry
+  reason         : string with EXACTLY 3 sentences separated by " • "
+  fib_analysis   : string — how Fibonacci influenced this trade (1-2 lines)
+  smc_analysis   : string — BOS/FVG confluence note (1-2 lines)
+  top_indicators : array of 3 strings (e.g. ["BOS", "FVG", "Volume"])
 
-CRITICAL RULES:
-1. entry MUST be > 0. Use current close. NEVER 0.
-2. LEARNING from RECENT_OUTCOMES:
-   - If same symbol had SL_HIT recently → be extra cautious, lower confidence
-   - If same symbol had TP_HIT → that strategy works, similar logic favored
-   - If same symbol had REVERSAL → market changed, adjust setup
-3. Fibonacci alignment + 3+ confluences → confidence 70-90
-4. Weak setup → HOLD with confidence 30-50
-5. SL must respect nearest Fibonacci level
-6. Return ONLY valid JSON array, no markdown fences, no explanation.
+═══════════════════════════════════════════════════════
+CRITICAL — LEARN FROM RECENT_OUTCOMES:
+═══════════════════════════════════════════════════════
+1. If SAME SYMBOL had SL_HIT recently:
+   • REDUCE confidence by 10-20 points
+   • Require EXTRA confluence (4+ indicators aligned) before signaling
+   • If setup is weak → return HOLD instead
+2. If SAME SYMBOL had TP_HIT recently:
+   • Similar setups FAVORED
+   • Confidence can be +10 points
+   • Mention "consistent with recent success" in reason
+3. If SAME SYMBOL had REVERSAL:
+   • Market direction changed — look at NEW trend
+   • Extra cautious — prefer HOLD if unclear
+4. If SAME SYMBOL had 3+ losses recently:
+   • Pair is ranging/volatile — return HOLD
+   • Note in reason: "pair unstable recently"
+5. If MULTIPLE pairs have SL_HIT:
+   • Market may be choppy — overall confidence lowered
+   • Prefer HOLD over risky entries
+
+═══════════════════════════════════════════════════════
+QUALITY RULES:
+═══════════════════════════════════════════════════════
+1. entry MUST always be > 0. Use current close.
+2. stop_loss MUST be different from entry (SL > entry for SELL, SL < entry for BUY)
+3. take_profit MUST be different from entry (TP > entry for BUY, TP < entry for SELL)
+4. Fibonacci alignment + 3+ confluences → confidence 70-90
+5. Weak setup → HOLD with confidence 30-50
+6. SL must respect nearest Fibonacci level (place SL beyond it)
+7. Do NOT repeat the same reason for multiple pairs — each must be unique to that pair's data
+8. Return ONLY valid JSON array, no markdown fences, no explanation.
+
+═══════════════════════════════════════════════════════
+RESPONSE FORMAT (example):
+═══════════════════════════════════════════════════════
+[
+  {{
+    "symbol": "BTCUSDT",
+    "signal": "BUY",
+    "confidence": 78,
+    "entry": 97006.5,
+    "stop_loss": 96400.0,
+    "take_profit": 98200.0,
+    "reason": "Bullish 4h trend with BOS confirmed above resistance. • RSI at 58 with volume spike supports momentum. • Fibonacci golden zone tested and held as support.",
+    "fib_analysis": "Price above 0.382 Fib with golden zone below as support",
+    "smc_analysis": "BOS on 4h confirmed, FVG on 15m acting as demand",
+    "top_indicators": ["BOS", "FVG", "Volume"]
+  }}
+]
 """
 
 
@@ -112,23 +158,36 @@ def _fallback_hold(symbol, reason, last_price=0.0):
     }
 
 
-# ==================== RECENT OUTCOMES ====================
+# ==================== RECENT OUTCOMES (with loss reasons) ====================
 def _get_recent_outcomes():
     """
-    Pichle signals ka outcome load karo — AI ko learning ke liye bhejna hai.
+    Pichle signals ka outcome AI ko bhejo — learning ke liye.
+    Loss ka reason bhi include karo.
     """
     try:
         from signal_tracker import check_all_signals
         outcomes = check_all_signals()
         summary = []
         for o in outcomes:
-            summary.append({
+            entry = {
                 "symbol": o["symbol"],
                 "prev_signal": o.get("direction", "?"),
                 "status": o["status"],           # TP_HIT | SL_HIT | REVERSAL | RUNNING
                 "pnl_pct": o.get("pnl_pct", 0),
                 "tp_level": o.get("tp_level", 0),
-            })
+                "duration_min": o.get("age_min", 0),
+            }
+
+            # Loss ka extra data (learning ke liye)
+            if o["status"] in ("SL_HIT", "REVERSAL"):
+                orig = o.get("original_signal", {})
+                entry.update({
+                    "original_confidence": orig.get("confidence", 0),
+                    "original_entry": orig.get("entry", 0),
+                    "original_reason": (orig.get("reason") or "")[:120],
+                    "current_price": o.get("current_price", 0),
+                })
+            summary.append(entry)
         log.info(f"📊 Recent outcomes for AI: {len(summary)} signals")
         return summary
     except Exception as e:
@@ -136,17 +195,52 @@ def _get_recent_outcomes():
         return []
 
 
-# ==================== MAIN: READY PAIRS ====================
+# ==================== VALIDATE SIGNAL ====================
+def _validate_signal(sig):
+    """
+    AI ke response ko validate karo — SL/TP entry ke barabar na ho.
+    """
+    try:
+        entry = float(sig.get("entry", 0) or 0)
+        sl = float(sig.get("stop_loss", 0) or 0)
+        tp = float(sig.get("take_profit", 0) or 0)
+        action = sig.get("signal", "HOLD")
+
+        if action == "HOLD":
+            return sig
+
+        if entry <= 0:
+            return sig
+
+        # SL galat side pe ho to fix
+        if action == "BUY":
+            if sl >= entry:
+                sl = entry * 0.99   # 1% below entry
+            if tp <= entry:
+                tp = entry * 1.02   # 2% above entry
+        else:  # SELL
+            if sl <= entry:
+                sl = entry * 1.01   # 1% above entry
+            if tp >= entry:
+                tp = entry * 0.98   # 2% below entry
+
+        return {**sig, "entry": entry, "stop_loss": sl, "take_profit": tp}
+    except Exception as e:
+        log.warning(f"_validate_signal fail {sig.get('symbol')}: {e}")
+        return sig
+
+
+# ==================== MAIN: ANALYZE READY PAIRS ====================
 def analyze_ready_pairs(ready_pairs):
     """
-    Sirf ready pairs AI ko bhejo + recent outcomes for learning.
+    Ready pairs AI ko bhejo + recent outcomes (learning).
     Gemini primary, Groq fallback.
     """
     if not ready_pairs:
         log.info("⚠️ No ready pairs — skipping AI")
         return []
 
-    # Ready pairs ko compact banao
+    # Bundles banao
     bundles = []
     for rp in ready_pairs:
         bundles.append({
@@ -157,7 +251,7 @@ def analyze_ready_pairs(ready_pairs):
             "tf_summary": rp["tf_summary"],
         })
 
-    # Recent outcomes (learning ke liye)
+    # Recent outcomes (learning)
     recent_outcomes = _get_recent_outcomes()
 
     # Combined payload
@@ -170,7 +264,7 @@ def analyze_ready_pairs(ready_pairs):
     log.info(f"📦 AI payload: {len(bundles)} ready pairs + {len(recent_outcomes)} outcomes")
     log.info(f"📊 Payload size: {total_chars} chars (~{total_chars // 4} tokens)")
 
-    # Chunked send
+    # Chunked
     chunks = [bundles[i:i+GEMINI_BATCH_SIZE] for i in range(0, len(bundles), GEMINI_BATCH_SIZE)]
     log.info(f"🔪 {len(chunks)} chunks of {GEMINI_BATCH_SIZE}")
 
@@ -178,7 +272,7 @@ def analyze_ready_pairs(ready_pairs):
     for idx, chunk in enumerate(chunks, 1):
         log.info(f"→ Chunk {idx}/{len(chunks)} ({len(chunk)} pairs)")
 
-        # Har chunk me outcomes bhi bhejo (learning)
+        # Har chunk me outcomes bhi bhejo
         chunk_payload = {
             "ready_pairs": chunk,
             "recent_outcomes": recent_outcomes,
@@ -186,7 +280,7 @@ def analyze_ready_pairs(ready_pairs):
 
         out = None
 
-        # Gemini first
+        # Gemini primary
         try:
             out = _call_gemini(chunk_payload)
             if out:
@@ -204,7 +298,7 @@ def analyze_ready_pairs(ready_pairs):
             except Exception as e:
                 log.error(f"❌ Groq failed chunk {idx}: {str(e)[:200]}")
 
-        # Dono fail — HOLD
+        # Both fail — HOLD
         if not out:
             for b in chunk:
                 last = 0
@@ -213,7 +307,9 @@ def analyze_ready_pairs(ready_pairs):
                     last = b["tf_summary"][tfs[-1]].get("close", 0)
                 results.append(_fallback_hold(b["symbol"], "AI unavailable", last))
         else:
-            results.extend(out)
+            # Validate har signal
+            for sig in out:
+                results.append(_validate_signal(sig))
 
         time.sleep(2)
 
@@ -232,9 +328,7 @@ def analyze_ready_pairs(ready_pairs):
 
 # ==================== LEGACY ALIAS ====================
 def analyze_all_pairs(tf_data_per_symbol):
-    """
-    Purane code ke liye alias — strategy filter ke saath.
-    """
+    """Purane code ke liye alias — strategy filter ke saath."""
     from strategies import find_ready_pairs
     ready = find_ready_pairs(tf_data_per_symbol, min_score=3)
     if not ready:
