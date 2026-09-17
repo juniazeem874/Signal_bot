@@ -1,18 +1,15 @@
 # config.py
 import os
 
-# ==================== API KEYS ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 
-# ==================== BRANDING ====================
 BOT_NAME    = "MJ TRADERS"
 BOT_TAGLINE = "Trading Signal Bot"
 
-# ==================== PAIRS ====================
 CRYPTO_PAIRS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
     "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
@@ -24,44 +21,35 @@ FOREX_PAIRS = [
 ]
 METAL_PAIRS = ["XAU/USD"]
 GOLD_PAIR   = "XAU/USD"
-
 ALL_PAIRS = CRYPTO_PAIRS + FOREX_PAIRS + METAL_PAIRS
 
-# ==================== TIMEFRAMES ====================
 CRYPTO_TFS = ["4h", "1h", "15m", "5m", "1m"]
 FOREX_TFS  = ["4h", "1h", "15m"]
 METAL_TFS  = ["1h", "15m"]
 
-# ==================== AUTO SCAN ====================
-AUTO_SCAN_INTERVAL = 3600        # ⭐ 60 min (quota safe)
+AUTO_SCAN_INTERVAL = 3600        # ⭐ 60 min
 AUTO_SCAN_ENABLED  = True
 SIGNAL_EXPIRY_HOURS = 6
 SIGNAL_AUTO_DELETE_HOURS = 6
 
-# ==================== SCHEDULE (PKT = UTC + 5) ====================
 BOT_START_HOUR_UTC = 3
 BOT_END_HOUR_UTC   = 20
 WEEKEND_CRYPTO_ONLY = True
 
-# ==================== AI (UPDATED MODELS) ====================
-GEMINI_MODEL      = "gemini-3.6-flash"          # ⭐ Latest
-GROQ_MODEL        = "llama-3.1-8b-instant"      # ⭐ Chhota model
-GEMINI_BATCH_SIZE = 19                           # ⭐ 1 chunk (all pairs)
+GEMINI_MODEL      = "gemini-3.6-flash"
+GROQ_MODEL        = "llama-3.1-8b-instant"
+GEMINI_BATCH_SIZE = 19
 
-# ==================== STRATEGY ====================
 MIN_SCORE_FOR_SIGNAL = 2
 SL_ATR_MULTIPLIER    = 1.5
 TP_ATR_MULTIPLIER    = 3.0
 
-# ==================== INDICATORS ====================
 CANDLES_PER_TF = 200
 
-# ==================== JSON STORAGE ====================
 DATA_DIR     = "data"
 MARKET_JSON  = "market_data.json"
 SIGNALS_JSON = "ai_signals.json"
 
-# ==================== SYMBOL ALIASES ====================
 SYMBOL_ALIASES = {
     "XAUUSD": "XAU/USD", "GOLD": "XAU/USD", "XAU": "XAU/USD",
     "BTCUSD": "BTCUSDT", "ETHUSD": "ETHUSDT", "SOLUSD": "SOLUSDT",
