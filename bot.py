@@ -415,3 +415,312 @@ async def _send_outcome_message(application, outcome, chat_ids):
     price_move_pct = abs(current - entry) / entry * 100 if entry else 0
 
     if status == "TP_HIT":
+        emoji = "🎯"
+        header = f"{emoji} *{BRAND} — TP HIT* {emoji}"
+        detail = f"TP{tp_level if tp_level else 1} HIT ✅  (+{pnl}%)"
+        note = (
+            f"🧠 *AI Learning:*\n"
+            f"• Setup worked as analyzed\n"
+            f"• Confidence was {confidence}% — accurate\n"
+            f"• Same conditions favored for future signals"
+        )
+    elif status == "SL_HIT":
+        emoji = "🛑"
+        header = f"{emoji} *{BRAND} — SL HIT* {emoji}"
+        detail = f"Stop Loss Hit ❌  ({pnl}%)"
+        note = (
+            f"🧠 *What went wrong:*\n"
+            f"• Market moved against by {price_move_pct:.2f}%\n"
+            f"• Original confidence: {confidence}%\n"
+            f"• Duration: {age_min:.0f} min"
+        )
+    else:
+        emoji = "⚠️"
+        header = f"{emoji} *{BRAND} — SIGNAL REMOVED* {emoji}"
+        detail = (
+            f"Market Reversal Detected ⚠️\n"
+            f"Signal *REMOVED* — market against position\n"
+            f"PnL at removal: {pnl}%"
+        )
+        note = (
+            f"🧠 *What happened:*\n"
+            f"• Market reversed without hitting SL\n"
+            f"• Position invalidated — closed early\n"
+            f"• Duration: {age_min:.0f} min"
+        )
+
+    text = (
+        f"{header}\n\n"
+        f"Pair: *{symbol}*\n"
+        f"Action: *{direction}*\n"
+        f"Entry: `{_fmt_price(entry)}`\n"
+        f"Current: `{_fmt_price(current)}`\n"
+        f"{detail}\n\n"
+        f"{note}"
+    )
+
+    for cid in chat_ids:
+        try:
+            await application.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"outcome fail {symbol}→{cid}: {e}")
+
+
+async def _send_loss_analysis_message(application, analysis, chat_ids):
+    """Deep loss analysis message."""
+    symbol = analysis["symbol"]
+    action = analysis["action"]
+    entry = analysis["entry"]
+    confidence = analysis["confidence"]
+    pnl = analysis["pnl_pct"]
+    wrong = analysis.get("wrong_indicators", [])
+    lesson = analysis.get("lesson", "")
+    fix = analysis.get("fix", "")
+    recovery = analysis.get("recovery_plan", "")
+
+    lines = [
+        f"🔍 *LOSS DEEP ANALYSIS* 🔍",
+        "",
+        f"Pair: *{symbol}*",
+        f"Action: *{action}*",
+        f"Entry: `{_fmt_price(entry)}`",
+        f"Confidence: {confidence}%",
+        f"PnL: {pnl}%",
+        "",
+    ]
+
+    if wrong:
+        lines.append("*❌ Wrong Indicators:*")
+        for w in wrong[:5]:
+            lines.append(f"• {w}")
+        lines.append("")
+
+    if lesson:
+        lines.append("*📚 Lesson:*")
+        lines.append(f"{lesson}")
+        lines.append("")
+
+    if fix:
+        lines.append("*🔧 Fix:*")
+        lines.append(f"{fix}")
+        lines.append("")
+
+    if recovery:
+        lines.append("*🔄 Recovery Plan:*")
+        lines.append(f"{recovery}")
+
+    text = "\n".join(lines)
+
+    for cid in chat_ids:
+        try:
+            await application.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"loss analysis fail {symbol}→{cid}: {e}")
+
+
+# ==================== MANUAL ANALYSIS ====================
+async def _run_analysis(symbol):
+    try:
+        if symbol in CRYPTO_PAIRS:
+            tf_data = fetch_crypto_multi_tf(symbol)
+        elif symbol in FOREX_PAIRS:
+            tf_data = fetch_forex_multi_tf(symbol)
+        elif symbol in METAL_PAIRS:
+            tf_data = fetch_gold_multi_tf()
+        else:
+            return f"❌ `{symbol}` not supported"
+
+        if not tf_data:
+            return f"❌ No market data for `{symbol}`"
+
+        ready = find_ready_pairs({symbol: tf_data}, min_score=2)
+        if not ready:
+            return f"🟡 *{symbol}* — No clear setup right now"
+
+        results = analyze_ready_pairs(ready)
+        if not results:
+            return f"⚠️ AI analysis failed for `{symbol}`."
+        return format_signal(results[0])
+    except Exception as e:
+        logger.error(f"_run_analysis crash {symbol}: {e}", exc_info=True)
+        return f"⚠️ Analysis failed: {e}"
+
+
+# ==================== STATUS ====================
+def _key_status(name, v):
+    return "✅" if v else "❌ MISSING"
+
+
+async def check_status(update, context):
+    await _delete_incoming(update, context)
+    bd = context.application.bot_data
+    cid = update.effective_chat.id
+    enabled = _get_auto_enabled(bd, cid)
+    tracked = load_tracked_signals()
+    losses = load_recovery_history()
+
+    msg = (
+        f"📊 *{BRAND} — Status*\n"
+        f"Auto: {'🟢 Active' if enabled else '🔴 Disabled'}\n"
+        f"Interval: {AUTO_SCAN_INTERVAL // 60} min\n"
+        f"Pairs: {len(ALL_PAIRS_SET)}\n"
+        f"Signal expiry: {SIGNAL_EXPIRY_HOURS}h\n"
+        f"Tracked signals: {len(tracked)}\n"
+        f"Recent losses (24h): {len(losses)}\n"
+        f"Your chat ID: `{cid}`\n"
+        f"Env chat IDs: `{TELEGRAM_CHAT_IDS}`\n\n"
+        f"Gemini: {_key_status('GEMINI', getattr(config, 'GEMINI_API_KEY', ''))}\n"
+        f"Groq: {_key_status('GROQ', getattr(config, 'GROQ_API_KEY', ''))}\n"
+        f"TwelveData: {_key_status('TD', getattr(config, 'TWELVEDATA_API_KEY', ''))}"
+    )
+    await safe_reply(update, context, msg, reply_markup=get_main_keyboard(enabled), track_nav=True)
+
+
+# ==================== WELCOME ====================
+async def send_welcome(update, context):
+    await _delete_incoming(update, context)
+    bd = context.application.bot_data
+    cid = update.effective_chat.id
+    bd.setdefault("active_chat_ids", set()).add(cid)
+    _set_auto_enabled(bd, cid, True)
+
+    msg = (
+        f"🤖 *{BRAND}*\n"
+        f"Trading Signal Bot\n\n"
+        f"Auto-scanning every `{AUTO_SCAN_INTERVAL // 60} min`\n"
+        f"BUY/SELL with Fibonacci + SMC.\n\n"
+        f"HOLD signals skipped.\n"
+        f"TP/SL tracked + loss analysis + recovery.\n\n"
+        f"Commands:\n"
+        f"/signals — Active signals\n"
+        f"/losses — Recent losses\n"
+        f"/analysis — Loss deep analysis\n"
+        f"/recovery — Recovery status\n"
+        f"/status — Bot health\n\n"
+        f"Your chat ID: `{cid}`\n\n"
+        f"👇 Menu se category chunein."
+    )
+    await safe_reply(update, context, msg, reply_markup=get_main_keyboard(True), track_nav=True)
+
+
+# ==================== TEXT HANDLER ====================
+async def handle_menu_text(update, context):
+    text = (update.message.text or "").strip()
+    await _delete_incoming(update, context)
+    bd = context.application.bot_data
+    cid = update.effective_chat.id
+    bd.setdefault("active_chat_ids", set()).add(cid)
+
+    # Commands
+    if text.startswith("/start") or text.startswith("/help"):
+        await send_welcome(update, context); return
+    if text.startswith("/status"):
+        await check_status(update, context); return
+    if text.startswith("/chatid") or text.startswith("/id"):
+        await safe_reply(update, context, f"Your chat ID: `{cid}`", parse_mode="Markdown")
+        return
+
+    # ⭐ /signals
+    if text.startswith("/signals"):
+        tracked = load_tracked_signals()
+        if not tracked:
+            await safe_reply(update, context, "📭 No tracked signals.", track_nav=True)
+            return
+        lines = [f"📋 *{len(tracked)} Active Signals:*\n"]
+        for s in tracked:
+            rec = " 🔄" if s.get("is_recovery") else ""
+            lines.append(f"• *{s['symbol']}*{rec} {s['signal']} @ `{_fmt_price(s['entry'])}` ({s.get('status', 'ACTIVE')})")
+        await safe_reply(update, context, "\n".join(lines), track_nav=True)
+        return
+
+    # ⭐ /losses
+    if text.startswith("/losses"):
+        losses = load_recovery_history()
+        if not losses:
+            await safe_reply(update, context, "✅ No losses in last 24h.", track_nav=True)
+            return
+        lines = [f"🛑 *{len(losses)} Losses (24h):*\n"]
+        for l in losses[-5:]:
+            lines.append(f"• *{l['symbol']}* {l['action']} @ `{_fmt_price(l['entry'])}` → {l.get('pnl_pct', 0)}%")
+        await safe_reply(update, context, "\n".join(lines), track_nav=True)
+        return
+
+    # ⭐ /analysis
+    if text.startswith("/analysis"):
+        analyses = load_loss_analyses()
+        if not analyses:
+            await safe_reply(update, context, "✅ No loss analyses (48h).", track_nav=True)
+            return
+        lines = [f"🔍 *{len(analyses)} Loss Analyses (48h):*\n"]
+        for a in analyses[-5:]:
+            lines.append(
+                f"• *{a['symbol']}* {a['action']} — {a['pnl_pct']}%\n"
+                f"  └ {a.get('lesson', 'N/A')[:80]}"
+            )
+        await safe_reply(update, context, "\n".join(lines), track_nav=True)
+        return
+
+    # ⭐ /recovery
+    if text.startswith("/recovery"):
+        patterns = get_loss_patterns()
+        lines = [
+            f"🔄 *Recovery Status*\n",
+            f"RSI Overbought BUYs: {patterns.get('rsi_overbought_buys', 0)}",
+            f"RSI Oversold SELLs: {patterns.get('rsi_oversold_sells', 0)}",
+            f"Trend Conflicts: {patterns.get('trend_conflicts', 0)}",
+            f"Low Volume Trades: {patterns.get('low_volume_trades', 0)}",
+            f"High Conf Failures: {patterns.get('high_confidence_fails', 0)}",
+            "",
+        ]
+        avoid = patterns.get("pairs_to_avoid", [])
+        if avoid:
+            lines.append("⚠️ *Pairs to Avoid:*")
+            for p in avoid:
+                lines.append(f"• {p}")
+        else:
+            lines.append("✅ No pairs to avoid")
+        await safe_reply(update, context, "\n".join(lines), track_nav=True)
+        return
+
+    # Buttons
+    if text == BACK_LABEL:
+        await safe_reply(update, context, f"🤖 {BRAND} — choose category:",
+                         reply_markup=get_main_keyboard(_get_auto_enabled(bd, cid)), track_nav=True)
+        return
+    if text == STATUS_LABEL:
+        await check_status(update, context); return
+    if text in (AUTO_ON_LABEL, AUTO_OFF_LABEL):
+        on = text == AUTO_ON_LABEL
+        _set_auto_enabled(bd, cid, on)
+        m = "✅ *Auto-Trade ON*" if on else "🛑 *Auto-Trade OFF*"
+        await safe_reply(update, context, m, reply_markup=get_main_keyboard(on), track_nav=True)
+        return
+    if text in LABEL_TO_CATEGORY:
+        ck = LABEL_TO_CATEGORY[text]
+        lbl, _ = CATEGORIES[ck]
+        await safe_reply(update, context, f"{lbl} — pick a pair:",
+                         reply_markup=pair_menu_keyboard(ck), track_nav=True)
+        return
+
+    sym = normalize_symbol(text)
+    if sym in ALL_PAIRS_SET:
+        ck = _category_of(sym)
+        await safe_reply(update, context, f"🔍 Analyzing `{sym}`...", track_nav=True)
+        msg = await _run_analysis(sym)
+        await safe_reply(update, context, msg, reply_markup=pair_menu_keyboard(ck),
+                         track_nav=False, delete_prev_nav=True,
+                         auto_delete_hours=SIGNAL_EXPIRY_HOURS)
+        return
+    await send_welcome(update, context)
+
+
+# ==================== BUILD APP ====================
+def build_app():
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN missing!")
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.bot_data["active_chat_ids"] = set()
+    app.bot_data["auto_trade_chats"] = {}
+    app.bot_data["nav_msg"] = {}
+    app.add_handler(MessageHandler(filters.TEXT, handle_menu_text))
+    return app
