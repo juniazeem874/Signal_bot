@@ -23,7 +23,7 @@ from strategies import find_ready_pairs
 from signal_tracker import (
     check_all_signals, update_signal_status, remove_signal,
     add_signal_to_tracker, load_tracked_signals,
-    log_loss, should_recover,
+    log_loss, should_recover, load_recovery_history,
 )
 
 logging.basicConfig(
@@ -172,14 +172,14 @@ def _fmt_price(value):
         return f"{v:.8f}"
 
 
-# ==================== TP CALCULATOR ====================
-ddef _calc_tps(sig):
+# ==================== ⭐ TP CALCULATOR (with validation) ====================
+def _calc_tps(sig):
     """TP/SL calculate karo — validation ke saath."""
     entry = float(sig.get("entry", 0) or 0)
     sl = float(sig.get("stop_loss", 0) or 0)
     action = sig.get("signal", "HOLD")
 
-    # Validation: entry aur action
+    # Validation: entry valid?
     if entry <= 0 or action == "HOLD":
         return (0, 0, 0, 0)
 
@@ -201,6 +201,37 @@ ddef _calc_tps(sig):
         return (entry + risk, entry + risk * 2, entry + risk * 3, sl)
     else:
         return (entry - risk, entry - risk * 2, entry - risk * 3, sl)
+
+
+# ==================== REASONS FORMATTER ====================
+def _format_reasons(sig):
+    raw = (sig.get("reason") or "").strip()
+    if " • " in raw:
+        parts = [p.strip() for p in raw.split(" • ") if p.strip()]
+    else:
+        parts = [p.strip() for p in raw.replace(";", ".").split(".") if p.strip()]
+    if not parts:
+        return "• No detailed reason available."
+    out = []
+    for p in parts[:3]:
+        if not p.endswith("."):
+            p += "."
+        out.append(f"• {p}")
+    return "\n".join(out)
+
+
+# ==================== PRICE GUARANTEE ====================
+def _ensure_price(sig):
+    entry = float(sig.get("entry", 0) or 0)
+    if entry > 0:
+        return sig
+    sym = sig.get("symbol", "")
+    price = get_current_price(sym)
+    if price > 0:
+        sig = {**sig, "entry": price}
+    return sig
+
+
 # ==================== SIGNAL FORMAT ====================
 def format_signal(sig):
     sig = _ensure_price(sig)
@@ -211,7 +242,6 @@ def format_signal(sig):
     reasons = _format_reasons(sig)
 
     lines = []
-    # ⭐ Recovery tag
     if sig.get("is_recovery"):
         lines.append("🔄 *RECOVERY SIGNAL* (after recent loss)\n")
 
@@ -251,7 +281,7 @@ def format_signal(sig):
 
 # ==================== SEND SIGNAL ====================
 async def send_signal(application, sig, chat_id_override=None):
-    """HOLD skip + Duplicate skip + Recovery tracking."""
+    """HOLD skip + Duplicate skip + Tracker."""
     # 1. HOLD skip
     if sig.get("signal") == "HOLD":
         logger.info(f"⏭️ Skipping HOLD: {sig.get('symbol')}")
@@ -282,6 +312,7 @@ async def send_signal(application, sig, chat_id_override=None):
         chat_ids = [cid for cid in active if _get_auto_enabled(bot_data, cid)]
         if not chat_ids and TELEGRAM_CHAT_IDS:
             chat_ids = TELEGRAM_CHAT_IDS[:]
+            logger.info(f"📌 Using {len(chat_ids)} IDs from env")
 
     if not chat_ids:
         logger.warning(f"⚠️ No subscribers for {symbol}")
@@ -335,11 +366,7 @@ def cleanup_signals(bot):
 
 # ==================== ⭐ PROCESS OUTCOMES ====================
 async def process_signal_outcomes(application):
-    """
-    Purane signals ka outcome check karo.
-    TP/SL/Reversal detect karo. AI ko learning ke liye bhejo.
-    Loss hua to recovery history me log karo.
-    """
+    """Purane signals ka outcome check + loss log + Telegram alert."""
     try:
         outcomes = check_all_signals()
         if not outcomes:
@@ -363,15 +390,13 @@ async def process_signal_outcomes(application):
             symbol = o["symbol"]
 
             if status in ("TP_HIT", "SL_HIT", "REVERSAL"):
-                # Send outcome message
                 await _send_outcome_message(application, o, chat_ids)
 
-                # ⭐ Loss hua to log karo
+                # Loss log
                 if status in ("SL_HIT", "REVERSAL"):
                     orig = o.get("original_signal", {})
                     log_loss(symbol, orig, o)
 
-                # Remove from tracker
                 update_signal_status(symbol, status)
                 remove_signal(symbol)
                 logger.info(f"📤 Outcome: {symbol} → {status} ({o.get('pnl_pct', 0)}%)")
@@ -382,7 +407,7 @@ async def process_signal_outcomes(application):
 
 
 async def _send_outcome_message(application, outcome, chat_ids):
-    """Detailed outcome message — loss ka reason ke saath."""
+    """Detailed outcome message."""
     symbol = outcome["symbol"]
     status = outcome["status"]
     direction = outcome.get("direction", "?")
@@ -394,7 +419,6 @@ async def _send_outcome_message(application, outcome, chat_ids):
 
     orig = outcome.get("original_signal", {})
     confidence = orig.get("confidence", 0)
-    orig_reason = orig.get("reason", "")
 
     price_move_pct = abs(current - entry) / entry * 100 if entry else 0
 
@@ -406,7 +430,7 @@ async def _send_outcome_message(application, outcome, chat_ids):
             f"🧠 *AI Learning:*\n"
             f"• Setup worked as analyzed\n"
             f"• Confidence was {confidence}% — accurate\n"
-            f"• Same conditions will be favored for future signals"
+            f"• Same conditions favored for future signals"
         )
     elif status == "SL_HIT":
         emoji = "🛑"
@@ -414,15 +438,15 @@ async def _send_outcome_message(application, outcome, chat_ids):
         detail = f"Stop Loss Hit ❌  ({pnl}%)"
         note = (
             f"🧠 *What went wrong:*\n"
-            f"• Market moved against signal by {price_move_pct:.2f}%\n"
+            f"• Market moved against by {price_move_pct:.2f}%\n"
             f"• Original confidence: {confidence}%\n"
             f"• Duration: {age_min:.0f} min\n\n"
             f"🔍 *Analysis:*\n"
-            f"• Setup invalidated by unexpected market move\n"
-            f"• Recovery trade will wait for fresh confluence\n"
-            f"• Next signal on this pair will be more cautious"
+            f"• Setup invalidated by unexpected move\n"
+            f"• Recovery trade will wait for fresh setup\n"
+            f"• Next signal on this pair will be cautious"
         )
-    else:  # REVERSAL
+    else:
         emoji = "⚠️"
         header = f"{emoji} *{BRAND} — SIGNAL REMOVED* {emoji}"
         detail = (
@@ -499,8 +523,6 @@ async def check_status(update, context):
     cid = update.effective_chat.id
     enabled = _get_auto_enabled(bd, cid)
     tracked = load_tracked_signals()
-
-    from signal_tracker import load_recovery_history
     losses = load_recovery_history()
 
     msg = (
@@ -575,7 +597,6 @@ async def handle_menu_text(update, context):
         await safe_reply(update, context, "\n".join(lines), track_nav=True)
         return
     if text.startswith("/losses"):
-        from signal_tracker import load_recovery_history
         losses = load_recovery_history()
         if not losses:
             await safe_reply(update, context, "✅ No losses in last 24h.", track_nav=True)
