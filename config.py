@@ -3,25 +3,14 @@ import os
 
 # ==================== API KEYS ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 
-# ==================== MULTI CHAT IDs ====================
-# Railway variable: TELEGRAM_CHAT_IDS=6201871784,987654321,123456789
-_raw_ids = os.getenv("TELEGRAM_CHAT_IDS", "") or os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_CHAT_IDS = [
-    int(cid.strip()) for cid in _raw_ids.split(",") if cid.strip().lstrip("-").isdigit()
-]
-
-# Backward compatibility (single ID)
-TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
-
 # ==================== BRANDING ====================
 BOT_NAME    = "MJ TRADERS"
 BOT_TAGLINE = "Trading Signal Bot"
-
-# ... baaki config same ...
 
 # ==================== PAIRS ====================
 CRYPTO_PAIRS = [
@@ -44,20 +33,20 @@ FOREX_TFS  = ["4h", "1h", "15m"]
 METAL_TFS  = ["1h", "15m"]
 
 # ==================== AUTO SCAN ====================
-AUTO_SCAN_INTERVAL = 300
+AUTO_SCAN_INTERVAL = 3600        # ⭐ 60 min (quota safe)
 AUTO_SCAN_ENABLED  = True
 SIGNAL_EXPIRY_HOURS = 6
 SIGNAL_AUTO_DELETE_HOURS = 6
 
-# ==================== SCHEDULE ====================
+# ==================== SCHEDULE (PKT = UTC + 5) ====================
 BOT_START_HOUR_UTC = 3
 BOT_END_HOUR_UTC   = 20
 WEEKEND_CRYPTO_ONLY = True
 
-# ==================== AI ====================
-GEMINI_MODEL      = "gemini-3.6-flash"
-GROQ_MODEL        = "openai/gpt-oss-120b"
-GEMINI_BATCH_SIZE = 10
+# ==================== AI (UPDATED MODELS) ====================
+GEMINI_MODEL      = "gemini-3.6-flash"          # ⭐ Latest
+GROQ_MODEL        = "llama-3.1-8b-instant"      # ⭐ Chhota model
+GEMINI_BATCH_SIZE = 19                           # ⭐ 1 chunk (all pairs)
 
 # ==================== STRATEGY ====================
 MIN_SCORE_FOR_SIGNAL = 2
