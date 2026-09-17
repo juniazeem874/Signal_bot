@@ -11,8 +11,7 @@ from config import (
     TELEGRAM_BOT_TOKEN, AUTO_SCAN_INTERVAL, BOT_NAME,
     CRYPTO_PAIRS, FOREX_PAIRS, METAL_PAIRS, GOLD_PAIR,
     SIGNAL_EXPIRY_HOURS, normalize_symbol,
-    TELEGRAM_CHAT_IDS,
-    TELEGRAM_CHAT_ID,
+    TELEGRAM_CHAT_IDS, TELEGRAM_CHAT_ID,
 )
 from data_fetcher import (
     fetch_crypto_multi_tf, fetch_forex_multi_tf, fetch_gold_multi_tf,
@@ -25,6 +24,10 @@ from signal_tracker import (
     add_signal_to_tracker, load_tracked_signals,
     log_loss, should_recover, load_recovery_history,
 )
+from loss_analyzer import (
+    analyze_loss, save_loss_analysis,
+    load_loss_analyses, get_loss_patterns,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,7 +37,6 @@ logger = logging.getLogger(__name__)
 
 BRAND = "MJ TRADERS"
 
-# ==================== LABELS ====================
 BACK_LABEL     = "⬅️ Back"
 STATUS_LABEL   = "📊 Status"
 AUTO_ON_LABEL  = "🟢 Auto ON"
@@ -50,9 +52,8 @@ ALL_PAIRS_SET = {p for _l, pairs in CATEGORIES.values() for p in pairs}
 
 DEFAULT_AUTO_ENABLED = getattr(config, "AUTO_SCAN_ENABLED", True)
 
-# ==================== MEMORY STORES ====================
 ACTIVE_SIGNALS = {}
-_LAST_SENT_SIGNALS = {}   # {symbol: (signal, entry, datetime)}
+_LAST_SENT_SIGNALS = {}
 
 
 # ==================== AUTO ON/OFF ====================
@@ -172,26 +173,22 @@ def _fmt_price(value):
         return f"{v:.8f}"
 
 
-# ==================== ⭐ TP CALCULATOR (with validation) ====================
+# ==================== TP CALCULATOR ====================
 def _calc_tps(sig):
-    """TP/SL calculate karo — validation ke saath."""
     entry = float(sig.get("entry", 0) or 0)
     sl = float(sig.get("stop_loss", 0) or 0)
     action = sig.get("signal", "HOLD")
 
-    # Validation: entry valid?
     if entry <= 0 or action == "HOLD":
         return (0, 0, 0, 0)
 
-    # SL invalid? 1% default
     if sl <= 0 or sl == entry:
         sl = entry * 0.99 if action == "BUY" else entry * 1.01
 
     risk = abs(entry - sl)
 
-    # ⭐ Risk 5% se zyada nahi (safety)
     if risk > entry * 0.05:
-        risk = entry * 0.02   # 2% max
+        risk = entry * 0.02
         sl = entry - risk if action == "BUY" else entry + risk
 
     if risk <= 0:
@@ -220,7 +217,6 @@ def _format_reasons(sig):
     return "\n".join(out)
 
 
-# ==================== PRICE GUARANTEE ====================
 def _ensure_price(sig):
     entry = float(sig.get("entry", 0) or 0)
     if entry > 0:
@@ -268,26 +264,25 @@ def format_signal(sig):
         reasons,
     ]
 
-    fib_note = sig.get("fib_analysis")
-    if fib_note and action != "HOLD":
-        lines.append(f"\n📐 *Fib:* {fib_note}")
+    fib = sig.get("fib_analysis")
+    if fib and action != "HOLD":
+        lines.append(f"\n📐 *Fib:* {fib}")
 
-    smc_note = sig.get("smc_analysis")
-    if smc_note and action != "HOLD":
-        lines.append(f"🎯 *SMC:* {smc_note}")
+    smc = sig.get("smc_analysis")
+    if smc and action != "HOLD":
+        lines.append(f"🎯 *SMC:* {smc}")
 
     return "\n".join(lines)
 
 
 # ==================== SEND SIGNAL ====================
 async def send_signal(application, sig, chat_id_override=None):
-    """HOLD skip + Duplicate skip + Tracker."""
-    # 1. HOLD skip
+    # HOLD skip
     if sig.get("signal") == "HOLD":
         logger.info(f"⏭️ Skipping HOLD: {sig.get('symbol')}")
         return
 
-    # 2. Duplicate skip
+    # Duplicate skip
     symbol = sig.get("symbol")
     signal = sig.get("signal")
     entry = round(float(sig.get("entry", 0) or 0), 6)
@@ -300,10 +295,9 @@ async def send_signal(application, sig, chat_id_override=None):
         same_signal = (prev_signal == signal)
         same_entry = abs(prev_entry - entry) < (entry * 0.001) if entry > 0 else False
         if same_signal and same_entry and age_min < 30:
-            logger.info(f"⏭️ Skipping duplicate {symbol} {signal} ({age_min:.0f} min ago)")
+            logger.info(f"⏭️ Skipping duplicate {symbol} {signal}")
             return
 
-    # 3. Recipients
     bot_data = application.bot_data
     if chat_id_override:
         chat_ids = [chat_id_override]
@@ -312,13 +306,11 @@ async def send_signal(application, sig, chat_id_override=None):
         chat_ids = [cid for cid in active if _get_auto_enabled(bot_data, cid)]
         if not chat_ids and TELEGRAM_CHAT_IDS:
             chat_ids = TELEGRAM_CHAT_IDS[:]
-            logger.info(f"📌 Using {len(chat_ids)} IDs from env")
 
     if not chat_ids:
         logger.warning(f"⚠️ No subscribers for {symbol}")
         return
 
-    # 4. Send
     text = format_signal(sig)
     msg_ids = {}
     sent_to = []
@@ -335,17 +327,14 @@ async def send_signal(application, sig, chat_id_override=None):
 
     await asyncio.gather(*[_send_one(cid) for cid in chat_ids])
 
-    # 5. Track
     if msg_ids:
-        ACTIVE_SIGNALS[symbol] = {
-            **sig, "ts": datetime.utcnow(), "msg_ids": msg_ids,
-        }
+        ACTIVE_SIGNALS[symbol] = {**sig, "ts": datetime.utcnow(), "msg_ids": msg_ids}
         _LAST_SENT_SIGNALS[symbol] = (signal, entry, now)
         try:
             add_signal_to_tracker({**sig, "telegram_msg_ids": msg_ids})
         except Exception as e:
-            logger.warning(f"tracker add fail {symbol}: {e}")
-        logger.info(f"✅ {symbol} {signal} → {len(sent_to)} chats (tracked)")
+            logger.warning(f"tracker fail {symbol}: {e}")
+        logger.info(f"✅ {symbol} {signal} → {len(sent_to)} chats")
 
 
 # ==================== CLEANUP ====================
@@ -364,9 +353,9 @@ def cleanup_signals(bot):
         logger.info(f"🧹 Cleaned {len(to_remove)} signals")
 
 
-# ==================== ⭐ PROCESS OUTCOMES ====================
+# ==================== PROCESS OUTCOMES ====================
 async def process_signal_outcomes(application):
-    """Purane signals ka outcome check + loss log + Telegram alert."""
+    """Outcome check + loss analysis + recovery."""
     try:
         outcomes = check_all_signals()
         if not outcomes:
@@ -382,7 +371,7 @@ async def process_signal_outcomes(application):
             chat_ids = TELEGRAM_CHAT_IDS[:]
 
         if not chat_ids:
-            logger.warning("No subscribers for outcome update")
+            logger.warning("No subscribers")
             return
 
         for o in outcomes:
@@ -392,22 +381,26 @@ async def process_signal_outcomes(application):
             if status in ("TP_HIT", "SL_HIT", "REVERSAL"):
                 await _send_outcome_message(application, o, chat_ids)
 
-                # Loss log
+                # Loss analysis
                 if status in ("SL_HIT", "REVERSAL"):
                     orig = o.get("original_signal", {})
                     log_loss(symbol, orig, o)
 
+                    analysis = analyze_loss(orig, o)
+                    save_loss_analysis(analysis)
+
+                    # Loss deep analysis message
+                    await _send_loss_analysis_message(application, analysis, chat_ids)
+
                 update_signal_status(symbol, status)
                 remove_signal(symbol)
-                logger.info(f"📤 Outcome: {symbol} → {status} ({o.get('pnl_pct', 0)}%)")
-            else:
-                logger.debug(f"⏳ {symbol} RUNNING (PnL {o.get('pnl_pct', 0)}%)")
+                logger.info(f"📤 Outcome: {symbol} → {status}")
     except Exception as e:
         logger.error(f"process_signal_outcomes fail: {e}", exc_info=True)
 
 
 async def _send_outcome_message(application, outcome, chat_ids):
-    """Detailed outcome message."""
+    """Outcome message (TP/SL/Reversal)."""
     symbol = outcome["symbol"]
     status = outcome["status"]
     direction = outcome.get("direction", "?")
@@ -419,234 +412,6 @@ async def _send_outcome_message(application, outcome, chat_ids):
 
     orig = outcome.get("original_signal", {})
     confidence = orig.get("confidence", 0)
-
     price_move_pct = abs(current - entry) / entry * 100 if entry else 0
 
     if status == "TP_HIT":
-        emoji = "🎯"
-        header = f"{emoji} *{BRAND} — TP HIT* {emoji}"
-        detail = f"TP{tp_level if tp_level else 1} HIT ✅  (+{pnl}%)"
-        note = (
-            f"🧠 *AI Learning:*\n"
-            f"• Setup worked as analyzed\n"
-            f"• Confidence was {confidence}% — accurate\n"
-            f"• Same conditions favored for future signals"
-        )
-    elif status == "SL_HIT":
-        emoji = "🛑"
-        header = f"{emoji} *{BRAND} — SL HIT* {emoji}"
-        detail = f"Stop Loss Hit ❌  ({pnl}%)"
-        note = (
-            f"🧠 *What went wrong:*\n"
-            f"• Market moved against by {price_move_pct:.2f}%\n"
-            f"• Original confidence: {confidence}%\n"
-            f"• Duration: {age_min:.0f} min\n\n"
-            f"🔍 *Analysis:*\n"
-            f"• Setup invalidated by unexpected move\n"
-            f"• Recovery trade will wait for fresh setup\n"
-            f"• Next signal on this pair will be cautious"
-        )
-    else:
-        emoji = "⚠️"
-        header = f"{emoji} *{BRAND} — SIGNAL REMOVED* {emoji}"
-        detail = (
-            f"Market Reversal Detected ⚠️\n"
-            f"Signal *REMOVED* — market against position\n"
-            f"PnL at removal: {pnl}%"
-        )
-        note = (
-            f"🧠 *What happened:*\n"
-            f"• Market reversed without hitting SL\n"
-            f"• Position invalidated — closed early\n"
-            f"• Duration: {age_min:.0f} min\n\n"
-            f"🔍 *Analysis:*\n"
-            f"• Setup structure broke down\n"
-            f"• Momentum shifted against signal\n"
-            f"• New signal will wait for fresh confluence"
-        )
-
-    text = (
-        f"{header}\n\n"
-        f"Pair: *{symbol}*\n"
-        f"Action: *{direction}*\n"
-        f"Entry: `{_fmt_price(entry)}`\n"
-        f"Current: `{_fmt_price(current)}`\n"
-        f"{detail}\n\n"
-        f"{note}"
-    )
-
-    for cid in chat_ids:
-        try:
-            await application.bot.send_message(
-                chat_id=cid, text=text, parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.warning(f"outcome send fail {symbol}→{cid}: {e}")
-
-
-# ==================== MANUAL ANALYSIS ====================
-async def _run_analysis(symbol):
-    try:
-        if symbol in CRYPTO_PAIRS:
-            tf_data = fetch_crypto_multi_tf(symbol)
-        elif symbol in FOREX_PAIRS:
-            tf_data = fetch_forex_multi_tf(symbol)
-        elif symbol in METAL_PAIRS:
-            tf_data = fetch_gold_multi_tf()
-        else:
-            return f"❌ `{symbol}` not supported"
-
-        if not tf_data:
-            return f"❌ No market data for `{symbol}` — try again."
-
-        ready = find_ready_pairs({symbol: tf_data}, min_score=2)
-        if not ready:
-            return f"🟡 *{symbol}* — No clear setup right now"
-
-        results = analyze_ready_pairs(ready)
-        if not results:
-            return f"⚠️ AI analysis failed for `{symbol}`."
-        return format_signal(results[0])
-    except Exception as e:
-        logger.error(f"_run_analysis crashed {symbol}: {e}", exc_info=True)
-        return f"⚠️ Analysis failed for `{symbol}`: {e}"
-
-
-# ==================== STATUS ====================
-def _key_status(name, v):
-    return "✅" if v else "❌ MISSING"
-
-
-async def check_status(update, context):
-    await _delete_incoming(update, context)
-    bd = context.application.bot_data
-    cid = update.effective_chat.id
-    enabled = _get_auto_enabled(bd, cid)
-    tracked = load_tracked_signals()
-    losses = load_recovery_history()
-
-    msg = (
-        f"📊 *{BRAND} — Status*\n"
-        f"Auto: {'🟢 Active' if enabled else '🔴 Disabled'}\n"
-        f"Interval: {AUTO_SCAN_INTERVAL // 60} min\n"
-        f"Pairs: {len(ALL_PAIRS_SET)}\n"
-        f"Signal expiry: {SIGNAL_EXPIRY_HOURS}h\n"
-        f"Tracked signals: {len(tracked)}\n"
-        f"Recent losses (24h): {len(losses)}\n"
-        f"Your chat ID: `{cid}`\n"
-        f"Env chat IDs: `{TELEGRAM_CHAT_IDS}`\n\n"
-        f"Gemini: {_key_status('GEMINI', getattr(config, 'GEMINI_API_KEY', ''))}\n"
-        f"Groq: {_key_status('GROQ', getattr(config, 'GROQ_API_KEY', ''))}\n"
-        f"TwelveData: {_key_status('TD', getattr(config, 'TWELVEDATA_API_KEY', ''))}"
-    )
-    await safe_reply(update, context, msg, reply_markup=get_main_keyboard(enabled), track_nav=True)
-
-
-# ==================== WELCOME ====================
-async def send_welcome(update, context):
-    """Welcome message."""
-    await _delete_incoming(update, context)
-    bd = context.application.bot_data
-    cid = update.effective_chat.id
-    bd.setdefault("active_chat_ids", set()).add(cid)
-    _set_auto_enabled(bd, cid, True)
-
-    msg = (
-        f"🤖 *{BRAND}*\n"
-        f"Trading Signal Bot\n\n"
-        f"Auto-scanning every `{AUTO_SCAN_INTERVAL // 60} min` — "
-        f"BUY/SELL alerts with Fibonacci + SMC.\n\n"
-        f"HOLD signals are not sent.\n"
-        f"TP/SL outcomes tracked automatically.\n\n"
-        f"Your chat ID: `{cid}`\n\n"
-        f"👇 Menu se category chunein, phir pair pe tap karein."
-    )
-    await safe_reply(update, context, msg, reply_markup=get_main_keyboard(True), track_nav=True)
-
-
-# ==================== TEXT HANDLER ====================
-async def handle_menu_text(update, context):
-    text = (update.message.text or "").strip()
-    await _delete_incoming(update, context)
-    bd = context.application.bot_data
-    cid = update.effective_chat.id
-    bd.setdefault("active_chat_ids", set()).add(cid)
-
-    if text.startswith("/start") or text.startswith("/help"):
-        await send_welcome(update, context); return
-    if text.startswith("/status"):
-        await check_status(update, context); return
-    if text.startswith("/chatid") or text.startswith("/id"):
-        await safe_reply(update, context,
-                         f"Your chat ID: `{cid}`\n\n"
-                         f"Railway me `TELEGRAM_CHAT_IDS` me add karo (comma-separated).",
-                         parse_mode="Markdown")
-        return
-    if text.startswith("/signals"):
-        tracked = load_tracked_signals()
-        if not tracked:
-            await safe_reply(update, context, "📭 No tracked signals currently.", track_nav=True)
-            return
-        lines = [f"📋 *{len(tracked)} Active Signals:*\n"]
-        for s in tracked:
-            rec = " 🔄" if s.get("is_recovery") else ""
-            lines.append(
-                f"• *{s['symbol']}*{rec} {s['signal']} — entry `{_fmt_price(s['entry'])}` "
-                f"({s.get('status', 'ACTIVE')})"
-            )
-        await safe_reply(update, context, "\n".join(lines), track_nav=True)
-        return
-    if text.startswith("/losses"):
-        losses = load_recovery_history()
-        if not losses:
-            await safe_reply(update, context, "✅ No losses in last 24h.", track_nav=True)
-            return
-        lines = [f"🛑 *{len(losses)} Losses (24h):*\n"]
-        for l in losses[-5:]:
-            lines.append(
-                f"• *{l['symbol']}* {l['action']} @ {_fmt_price(l['entry'])} "
-                f"→ {l.get('pnl_pct', 0)}%"
-            )
-        await safe_reply(update, context, "\n".join(lines), track_nav=True)
-        return
-    if text == BACK_LABEL:
-        await safe_reply(update, context, f"🤖 {BRAND} — choose a category:",
-                         reply_markup=get_main_keyboard(_get_auto_enabled(bd, cid)), track_nav=True)
-        return
-    if text == STATUS_LABEL:
-        await check_status(update, context); return
-    if text in (AUTO_ON_LABEL, AUTO_OFF_LABEL):
-        on = text == AUTO_ON_LABEL
-        _set_auto_enabled(bd, cid, on)
-        m = "✅ *Auto-Trade Activated!*" if on else "🛑 *Auto-Trade Deactivated.*"
-        await safe_reply(update, context, m, reply_markup=get_main_keyboard(on), track_nav=True)
-        return
-    if text in LABEL_TO_CATEGORY:
-        ck = LABEL_TO_CATEGORY[text]
-        lbl, _ = CATEGORIES[ck]
-        await safe_reply(update, context, f"{lbl} — pick a pair:",
-                         reply_markup=pair_menu_keyboard(ck), track_nav=True)
-        return
-
-    sym = normalize_symbol(text)
-    if sym in ALL_PAIRS_SET:
-        ck = _category_of(sym)
-        await safe_reply(update, context, f"🔍 Analyzing `{sym}`...", track_nav=True)
-        msg = await _run_analysis(sym)
-        await safe_reply(update, context, msg, reply_markup=pair_menu_keyboard(ck),
-                         track_nav=False, delete_prev_nav=True,
-                         auto_delete_hours=SIGNAL_EXPIRY_HOURS)
-        return
-    await send_welcome(update, context)
-
-
-# ==================== BUILD APP ====================
-def build_app():
-    if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN missing!")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.bot_data["active_chat_ids"] = set()
-    app.bot_data["auto_trade_chats"] = {}
-    app.bot_data["nav_msg"] = {}
-    app.add_handler(MessageHandler(filters.TEXT, handle_menu_text))
-    return app
