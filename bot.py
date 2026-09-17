@@ -173,21 +173,27 @@ def _fmt_price(value):
 
 
 # ==================== TP CALCULATOR ====================
-def _calc_tps(sig):
+ddef _calc_tps(sig):
+    """TP/SL calculate karo — validation ke saath."""
     entry = float(sig.get("entry", 0) or 0)
     sl = float(sig.get("stop_loss", 0) or 0)
     action = sig.get("signal", "HOLD")
 
-    if entry <= 0 or action == "HOLD" or entry == sl:
-        return (0, 0, 0, sl)
+    # Validation: entry aur action
+    if entry <= 0 or action == "HOLD":
+        return (0, 0, 0, 0)
 
-    if sl <= 0:
-        atr = float(sig.get("atr", 0) or 0)
-        if atr <= 0:
-            atr = entry * 0.005
-        sl = entry - atr * 1.5 if action == "BUY" else entry + atr * 1.5
+    # SL invalid? 1% default
+    if sl <= 0 or sl == entry:
+        sl = entry * 0.99 if action == "BUY" else entry * 1.01
 
     risk = abs(entry - sl)
+
+    # ⭐ Risk 5% se zyada nahi (safety)
+    if risk > entry * 0.05:
+        risk = entry * 0.02   # 2% max
+        sl = entry - risk if action == "BUY" else entry + risk
+
     if risk <= 0:
         return (0, 0, 0, sl)
 
@@ -195,35 +201,6 @@ def _calc_tps(sig):
         return (entry + risk, entry + risk * 2, entry + risk * 3, sl)
     else:
         return (entry - risk, entry - risk * 2, entry - risk * 3, sl)
-
-
-def _format_reasons(sig):
-    raw = (sig.get("reason") or "").strip()
-    if " • " in raw:
-        parts = [p.strip() for p in raw.split(" • ") if p.strip()]
-    else:
-        parts = [p.strip() for p in raw.replace(";", ".").split(".") if p.strip()]
-    if not parts:
-        return "• No detailed reason available."
-    out = []
-    for p in parts[:3]:
-        if not p.endswith("."):
-            p += "."
-        out.append(f"• {p}")
-    return "\n".join(out)
-
-
-def _ensure_price(sig):
-    entry = float(sig.get("entry", 0) or 0)
-    if entry > 0:
-        return sig
-    sym = sig.get("symbol", "")
-    price = get_current_price(sym)
-    if price > 0:
-        sig = {**sig, "entry": price}
-    return sig
-
-
 # ==================== SIGNAL FORMAT ====================
 def format_signal(sig):
     sig = _ensure_price(sig)
@@ -545,20 +522,22 @@ async def check_status(update, context):
 
 # ==================== WELCOME ====================
 async def send_welcome(update, context):
+    """Welcome message."""
     await _delete_incoming(update, context)
     bd = context.application.bot_data
     cid = update.effective_chat.id
     bd.setdefault("active_chat_ids", set()).add(cid)
     _set_auto_enabled(bd, cid, True)
+
     msg = (
         f"🤖 *{BRAND}*\n"
         f"Trading Signal Bot\n\n"
         f"Auto-scanning every `{AUTO_SCAN_INTERVAL // 60} min` — "
-        f"BUY/SELL alerts with Fibonacci + SMC.\n"
-        f"HOLD signals skipped.\n"
-        f"TP/SL/Reversal tracked + recovery trades.\n\n"
+        f"BUY/SELL alerts with Fibonacci + SMC.\n\n"
+        f"HOLD signals are not sent.\n"
+        f"TP/SL outcomes tracked automatically.\n\n"
         f"Your chat ID: `{cid}`\n\n"
-        "👇 Menu se category chunein, phir pair pe tap karein."
+        f"👇 Menu se category chunein, phir pair pe tap karein."
     )
     await safe_reply(update, context, msg, reply_markup=get_main_keyboard(True), track_nav=True)
 
