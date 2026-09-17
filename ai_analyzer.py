@@ -25,21 +25,32 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 # ==================== PROMPT ====================
 SYSTEM_PROMPT = f"""You are a professional multi-asset trading analyst for {BOT_NAME} signals channel.
 
-You receive PRE-FILTERED trading setups (each has score 0-6, direction hint, reasons).
-Your job: confirm/reject, give entry/SL/TP, explain why, rate confidence.
+You will receive:
+1. READY_PAIRS — new trade setups (pre-filtered by strategy)
+2. RECENT_OUTCOMES — what happened to previous signals (TP_HIT/SL_HIT/REVERSAL)
 
-For EACH asset return JSON with keys:
-  symbol, signal ("BUY"|"SELL"|"HOLD"), confidence (0-100),
-  entry (current price, NEVER 0), stop_loss, take_profit,
-  reason (3 sentences separated by " • "),
-  fib_analysis (string), smc_analysis (string), top_indicators (list of 3)
+For each READY PAIR, return JSON object with EXACT keys:
+  symbol         : string
+  signal         : "BUY" | "SELL" | "HOLD"
+  confidence     : integer 0-100
+  entry          : number (current price from smallest TF close) — NEVER 0
+  stop_loss      : number (ATR-based or beyond nearest Fib level)
+  take_profit    : number (1:2 minimum risk-reward)
+  reason         : string with 3 sentences separated by " • "
+  fib_analysis   : string — how Fibonacci influences this trade
+  smc_analysis   : string — BOS/FVG confluence note
+  top_indicators : array of 3 strings
 
-Rules:
-1. entry MUST be > 0.
-2. Fibonacci alignment + 3+ confluences → confidence 70-90.
-3. Weak setup → HOLD, confidence 30-50.
-4. SL must respect nearest Fibonacci level.
-5. Return ONLY valid JSON array, no markdown.
+CRITICAL RULES:
+1. entry MUST be > 0. Use current close. NEVER 0.
+2. LEARNING from RECENT_OUTCOMES:
+   - If same symbol had SL_HIT recently → be extra cautious, lower confidence
+   - If same symbol had TP_HIT → that strategy works, similar logic favored
+   - If same symbol had REVERSAL → market changed, adjust setup
+3. Fibonacci alignment + 3+ confluences → confidence 70-90
+4. Weak setup → HOLD with confidence 30-50
+5. SL must respect nearest Fibonacci level
+6. Return ONLY valid JSON array, no markdown fences, no explanation.
 """
 
 
@@ -66,23 +77,23 @@ def _parse_json(text):
 
 
 # ==================== AI CALLS ====================
-def _call_gemini(batch):
+def _call_gemini(payload):
     if gemini_model is None:
         raise RuntimeError("Gemini not configured")
-    prompt = SYSTEM_PROMPT + "\n\nDATA:\n" + json.dumps(batch, separators=(",", ":"))
+    prompt = SYSTEM_PROMPT + "\n\nDATA:\n" + json.dumps(payload, separators=(",", ":"))
     log.info(f"📡 Gemini request: {len(prompt)} chars")
     resp = gemini_model.generate_content(prompt)
     return _parse_json(resp.text)
 
 
-def _call_groq(batch):
+def _call_groq(payload):
     if groq_client is None:
         raise RuntimeError("Groq not configured")
     resp = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": json.dumps(batch, separators=(",", ":"))},
+            {"role": "user",   "content": json.dumps(payload, separators=(",", ":"))},
         ],
         temperature=0.3,
         response_format={"type": "json_object"},
@@ -101,13 +112,41 @@ def _fallback_hold(symbol, reason, last_price=0.0):
     }
 
 
+# ==================== RECENT OUTCOMES ====================
+def _get_recent_outcomes():
+    """
+    Pichle signals ka outcome load karo — AI ko learning ke liye bhejna hai.
+    """
+    try:
+        from signal_tracker import check_all_signals
+        outcomes = check_all_signals()
+        summary = []
+        for o in outcomes:
+            summary.append({
+                "symbol": o["symbol"],
+                "prev_signal": o.get("direction", "?"),
+                "status": o["status"],           # TP_HIT | SL_HIT | REVERSAL | RUNNING
+                "pnl_pct": o.get("pnl_pct", 0),
+                "tp_level": o.get("tp_level", 0),
+            })
+        log.info(f"📊 Recent outcomes for AI: {len(summary)} signals")
+        return summary
+    except Exception as e:
+        log.warning(f"get_recent_outcomes fail: {e}")
+        return []
+
+
 # ==================== MAIN: READY PAIRS ====================
 def analyze_ready_pairs(ready_pairs):
-    """Sirf ready pairs AI ko bhejo."""
+    """
+    Sirf ready pairs AI ko bhejo + recent outcomes for learning.
+    Gemini primary, Groq fallback.
+    """
     if not ready_pairs:
         log.info("⚠️ No ready pairs — skipping AI")
         return []
 
+    # Ready pairs ko compact banao
     bundles = []
     for rp in ready_pairs:
         bundles.append({
@@ -118,34 +157,54 @@ def analyze_ready_pairs(ready_pairs):
             "tf_summary": rp["tf_summary"],
         })
 
-    log.info(f"📦 AI payload: {len(bundles)} ready pairs")
-    total_chars = len(json.dumps(bundles, separators=(",", ":")))
+    # Recent outcomes (learning ke liye)
+    recent_outcomes = _get_recent_outcomes()
+
+    # Combined payload
+    payload = {
+        "ready_pairs": bundles,
+        "recent_outcomes": recent_outcomes,
+    }
+
+    total_chars = len(json.dumps(payload, separators=(",", ":")))
+    log.info(f"📦 AI payload: {len(bundles)} ready pairs + {len(recent_outcomes)} outcomes")
     log.info(f"📊 Payload size: {total_chars} chars (~{total_chars // 4} tokens)")
 
+    # Chunked send
     chunks = [bundles[i:i+GEMINI_BATCH_SIZE] for i in range(0, len(bundles), GEMINI_BATCH_SIZE)]
     log.info(f"🔪 {len(chunks)} chunks of {GEMINI_BATCH_SIZE}")
 
     results = []
     for idx, chunk in enumerate(chunks, 1):
         log.info(f"→ Chunk {idx}/{len(chunks)} ({len(chunk)} pairs)")
+
+        # Har chunk me outcomes bhi bhejo (learning)
+        chunk_payload = {
+            "ready_pairs": chunk,
+            "recent_outcomes": recent_outcomes,
+        }
+
         out = None
 
+        # Gemini first
         try:
-            out = _call_gemini(chunk)
+            out = _call_gemini(chunk_payload)
             if out:
                 log.info(f"✅ Gemini OK chunk {idx}")
         except Exception as e:
             log.warning(f"⚠️ Gemini failed chunk {idx}: {str(e)[:200]}")
 
+        # Groq fallback
         if not out:
             try:
                 log.info(f"→ Groq fallback chunk {idx}")
-                out = _call_groq(chunk)
+                out = _call_groq(chunk_payload)
                 if out:
                     log.info(f"✅ Groq OK chunk {idx}")
             except Exception as e:
                 log.error(f"❌ Groq failed chunk {idx}: {str(e)[:200]}")
 
+        # Dono fail — HOLD
         if not out:
             for b in chunk:
                 last = 0
@@ -158,6 +217,7 @@ def analyze_ready_pairs(ready_pairs):
 
         time.sleep(2)
 
+    # Ensure all symbols have results
     got = {r.get("symbol") for r in results}
     for b in bundles:
         if b["symbol"] not in got:
@@ -170,16 +230,15 @@ def analyze_ready_pairs(ready_pairs):
     return results
 
 
-# ==================== LEGACY SUPPORT (purane code ke liye) ====================
+# ==================== LEGACY ALIAS ====================
 def analyze_all_pairs(tf_data_per_symbol):
     """
-    Purane main.py/bot.py ke liye alias.
-    Internally strategy filter + analyze_ready_pairs use karta hai.
+    Purane code ke liye alias — strategy filter ke saath.
     """
     from strategies import find_ready_pairs
     ready = find_ready_pairs(tf_data_per_symbol, min_score=3)
     if not ready:
-        log.info("⚠️ No ready pairs — returning HOLDs for all")
+        log.info("⚠️ No ready pairs — returning HOLDs")
         return [
             _fallback_hold(sym, "No confluence detected", 0)
             for sym in tf_data_per_symbol.keys()
@@ -188,7 +247,7 @@ def analyze_all_pairs(tf_data_per_symbol):
 
 
 def build_indicator_bundle(symbol, tf_data):
-    """Purane code ke liye — strategies.py me already hai."""
+    """Purane code ke liye compatibility."""
     from strategies import score_pair
     result = score_pair(symbol, tf_data)
     return {
