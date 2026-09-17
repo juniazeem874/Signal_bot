@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 BRAND = "MJ TRADERS"
 
+# ==================== LABELS ====================
 BACK_LABEL     = "⬅️ Back"
 STATUS_LABEL   = "📊 Status"
 AUTO_ON_LABEL  = "🟢 Auto ON"
@@ -52,6 +53,7 @@ ALL_PAIRS_SET = {p for _l, pairs in CATEGORIES.values() for p in pairs}
 
 DEFAULT_AUTO_ENABLED = getattr(config, "AUTO_SCAN_ENABLED", True)
 
+# ==================== MEMORY ====================
 ACTIVE_SIGNALS = {}
 _LAST_SENT_SIGNALS = {}
 
@@ -200,7 +202,7 @@ def _calc_tps(sig):
         return (entry - risk, entry - risk * 2, entry - risk * 3, sl)
 
 
-# ==================== REASONS FORMATTER ====================
+# ==================== REASONS ====================
 def _format_reasons(sig):
     raw = (sig.get("reason") or "").strip()
     if " • " in raw:
@@ -277,12 +279,10 @@ def format_signal(sig):
 
 # ==================== SEND SIGNAL ====================
 async def send_signal(application, sig, chat_id_override=None):
-    # HOLD skip
     if sig.get("signal") == "HOLD":
         logger.info(f"⏭️ Skipping HOLD: {sig.get('symbol')}")
         return
 
-    # Duplicate skip
     symbol = sig.get("symbol")
     signal = sig.get("signal")
     entry = round(float(sig.get("entry", 0) or 0), 6)
@@ -355,7 +355,6 @@ def cleanup_signals(bot):
 
 # ==================== PROCESS OUTCOMES ====================
 async def process_signal_outcomes(application):
-    """Outcome check + loss analysis + recovery."""
     try:
         outcomes = check_all_signals()
         if not outcomes:
@@ -381,7 +380,6 @@ async def process_signal_outcomes(application):
             if status in ("TP_HIT", "SL_HIT", "REVERSAL"):
                 await _send_outcome_message(application, o, chat_ids)
 
-                # Loss analysis
                 if status in ("SL_HIT", "REVERSAL"):
                     orig = o.get("original_signal", {})
                     log_loss(symbol, orig, o)
@@ -389,7 +387,6 @@ async def process_signal_outcomes(application):
                     analysis = analyze_loss(orig, o)
                     save_loss_analysis(analysis)
 
-                    # Loss deep analysis message
                     await _send_loss_analysis_message(application, analysis, chat_ids)
 
                 update_signal_status(symbol, status)
@@ -400,7 +397,6 @@ async def process_signal_outcomes(application):
 
 
 async def _send_outcome_message(application, outcome, chat_ids):
-    """Outcome message (TP/SL/Reversal)."""
     symbol = outcome["symbol"]
     status = outcome["status"]
     direction = outcome.get("direction", "?")
@@ -461,13 +457,14 @@ async def _send_outcome_message(application, outcome, chat_ids):
 
     for cid in chat_ids:
         try:
-            await application.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+            await application.bot.send_message(
+                chat_id=cid, text=text, parse_mode="Markdown"
+            )
         except Exception as e:
             logger.warning(f"outcome fail {symbol}→{cid}: {e}")
 
 
 async def _send_loss_analysis_message(application, analysis, chat_ids):
-    """Deep loss analysis message."""
     symbol = analysis["symbol"]
     action = analysis["action"]
     entry = analysis["entry"]
@@ -513,7 +510,9 @@ async def _send_loss_analysis_message(application, analysis, chat_ids):
 
     for cid in chat_ids:
         try:
-            await application.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+            await application.bot.send_message(
+                chat_id=cid, text=text, parse_mode="Markdown"
+            )
         except Exception as e:
             logger.warning(f"loss analysis fail {symbol}→{cid}: {e}")
 
@@ -611,7 +610,6 @@ async def handle_menu_text(update, context):
     cid = update.effective_chat.id
     bd.setdefault("active_chat_ids", set()).add(cid)
 
-    # Commands
     if text.startswith("/start") or text.startswith("/help"):
         await send_welcome(update, context); return
     if text.startswith("/status"):
@@ -620,7 +618,6 @@ async def handle_menu_text(update, context):
         await safe_reply(update, context, f"Your chat ID: `{cid}`", parse_mode="Markdown")
         return
 
-    # ⭐ /signals
     if text.startswith("/signals"):
         tracked = load_tracked_signals()
         if not tracked:
@@ -633,7 +630,6 @@ async def handle_menu_text(update, context):
         await safe_reply(update, context, "\n".join(lines), track_nav=True)
         return
 
-    # ⭐ /losses
     if text.startswith("/losses"):
         losses = load_recovery_history()
         if not losses:
@@ -645,7 +641,6 @@ async def handle_menu_text(update, context):
         await safe_reply(update, context, "\n".join(lines), track_nav=True)
         return
 
-    # ⭐ /analysis
     if text.startswith("/analysis"):
         analyses = load_loss_analyses()
         if not analyses:
@@ -660,7 +655,6 @@ async def handle_menu_text(update, context):
         await safe_reply(update, context, "\n".join(lines), track_nav=True)
         return
 
-    # ⭐ /recovery
     if text.startswith("/recovery"):
         patterns = get_loss_patterns()
         lines = [
@@ -682,7 +676,6 @@ async def handle_menu_text(update, context):
         await safe_reply(update, context, "\n".join(lines), track_nav=True)
         return
 
-    # Buttons
     if text == BACK_LABEL:
         await safe_reply(update, context, f"🤖 {BRAND} — choose category:",
                          reply_markup=get_main_keyboard(_get_auto_enabled(bd, cid)), track_nav=True)
