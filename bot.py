@@ -558,4 +558,95 @@ async def send_welcome(update, context):
         f"HOLD signals skipped.\n"
         f"TP/SL/Reversal tracked + recovery trades.\n\n"
         f"Your chat ID: `{cid}`\n\n"
-        "👇 Menu se category chunein, phir pair
+        "👇 Menu se category chunein, phir pair pe tap karein."
+    )
+    await safe_reply(update, context, msg, reply_markup=get_main_keyboard(True), track_nav=True)
+
+
+# ==================== TEXT HANDLER ====================
+async def handle_menu_text(update, context):
+    text = (update.message.text or "").strip()
+    await _delete_incoming(update, context)
+    bd = context.application.bot_data
+    cid = update.effective_chat.id
+    bd.setdefault("active_chat_ids", set()).add(cid)
+
+    if text.startswith("/start") or text.startswith("/help"):
+        await send_welcome(update, context); return
+    if text.startswith("/status"):
+        await check_status(update, context); return
+    if text.startswith("/chatid") or text.startswith("/id"):
+        await safe_reply(update, context,
+                         f"Your chat ID: `{cid}`\n\n"
+                         f"Railway me `TELEGRAM_CHAT_IDS` me add karo (comma-separated).",
+                         parse_mode="Markdown")
+        return
+    if text.startswith("/signals"):
+        tracked = load_tracked_signals()
+        if not tracked:
+            await safe_reply(update, context, "📭 No tracked signals currently.", track_nav=True)
+            return
+        lines = [f"📋 *{len(tracked)} Active Signals:*\n"]
+        for s in tracked:
+            rec = " 🔄" if s.get("is_recovery") else ""
+            lines.append(
+                f"• *{s['symbol']}*{rec} {s['signal']} — entry `{_fmt_price(s['entry'])}` "
+                f"({s.get('status', 'ACTIVE')})"
+            )
+        await safe_reply(update, context, "\n".join(lines), track_nav=True)
+        return
+    if text.startswith("/losses"):
+        from signal_tracker import load_recovery_history
+        losses = load_recovery_history()
+        if not losses:
+            await safe_reply(update, context, "✅ No losses in last 24h.", track_nav=True)
+            return
+        lines = [f"🛑 *{len(losses)} Losses (24h):*\n"]
+        for l in losses[-5:]:
+            lines.append(
+                f"• *{l['symbol']}* {l['action']} @ {_fmt_price(l['entry'])} "
+                f"→ {l.get('pnl_pct', 0)}%"
+            )
+        await safe_reply(update, context, "\n".join(lines), track_nav=True)
+        return
+    if text == BACK_LABEL:
+        await safe_reply(update, context, f"🤖 {BRAND} — choose a category:",
+                         reply_markup=get_main_keyboard(_get_auto_enabled(bd, cid)), track_nav=True)
+        return
+    if text == STATUS_LABEL:
+        await check_status(update, context); return
+    if text in (AUTO_ON_LABEL, AUTO_OFF_LABEL):
+        on = text == AUTO_ON_LABEL
+        _set_auto_enabled(bd, cid, on)
+        m = "✅ *Auto-Trade Activated!*" if on else "🛑 *Auto-Trade Deactivated.*"
+        await safe_reply(update, context, m, reply_markup=get_main_keyboard(on), track_nav=True)
+        return
+    if text in LABEL_TO_CATEGORY:
+        ck = LABEL_TO_CATEGORY[text]
+        lbl, _ = CATEGORIES[ck]
+        await safe_reply(update, context, f"{lbl} — pick a pair:",
+                         reply_markup=pair_menu_keyboard(ck), track_nav=True)
+        return
+
+    sym = normalize_symbol(text)
+    if sym in ALL_PAIRS_SET:
+        ck = _category_of(sym)
+        await safe_reply(update, context, f"🔍 Analyzing `{sym}`...", track_nav=True)
+        msg = await _run_analysis(sym)
+        await safe_reply(update, context, msg, reply_markup=pair_menu_keyboard(ck),
+                         track_nav=False, delete_prev_nav=True,
+                         auto_delete_hours=SIGNAL_EXPIRY_HOURS)
+        return
+    await send_welcome(update, context)
+
+
+# ==================== BUILD APP ====================
+def build_app():
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN missing!")
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.bot_data["active_chat_ids"] = set()
+    app.bot_data["auto_trade_chats"] = {}
+    app.bot_data["nav_msg"] = {}
+    app.add_handler(MessageHandler(filters.TEXT, handle_menu_text))
+    return app
