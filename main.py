@@ -14,7 +14,7 @@ from strategies import find_ready_pairs
 from ai_analyzer import analyze_ready_pairs
 from bot import (
     build_app, send_signal, cleanup_signals,
-    process_signal_outcomes,        # ⭐ NAYA: outcome updates
+    process_signal_outcomes,
 )
 from data_store import save_market_data, save_signals
 
@@ -30,16 +30,17 @@ telegram_app = build_app()
 # ==================== ANALYSIS CYCLE ====================
 async def run_analysis_async(only_crypto=False):
     """
-    Ek complete cycle:
-    0. Purane signals ka outcome check karo (TP/SL/Reversal)
+    Complete cycle:
+    0. Purane signals ka outcome check (losses log karo)
     1. Fresh data fetch
-    2. Strategy filter (ready pairs)
-    3. AI analysis
-    4. HOLD skip, sirf BUY/SELL send
-    5. Track naye signals
+    2. Strategy filter
+    3. AI analysis (learning from outcomes)
+    4. HOLD skip + duplicate skip
+    5. Recovery detection + send
+    6. Track naye signals
     """
     try:
-        # ============ STEP 0: OUTCOME CHECK ============
+        # ============ STEP 0: OUTCOMES + LOSS LOGGING ============
         log.info("📊 Checking previous signal outcomes...")
         try:
             await process_signal_outcomes(telegram_app)
@@ -51,7 +52,7 @@ async def run_analysis_async(only_crypto=False):
         clear_cache()
 
         if only_crypto:
-            log.info(f"🪙 WEEKEND MODE — fetching ONLY crypto ({len(CRYPTO_PAIRS)} pairs)")
+            log.info(f"🪙 WEEKEND — fetching ONLY crypto ({len(CRYPTO_PAIRS)} pairs)")
         else:
             log.info(f"🔍 Fetching all pairs ({len(ALL_PAIRS)})...")
 
@@ -71,7 +72,7 @@ async def run_analysis_async(only_crypto=False):
         ready = find_ready_pairs(raw, min_score=3)
 
         if not ready:
-            log.info("😴 No pairs ready this cycle — skipping AI")
+            log.info("😴 No pairs ready this cycle")
             save_signals([])
             return
 
@@ -84,22 +85,36 @@ async def run_analysis_async(only_crypto=False):
         # ============ STEP 5: SAVE SIGNALS ============
         save_signals(results)
 
-        # ============ STEP 6: SEND (HOLD SKIP) ============
+        # ============ STEP 6: SEND (HOLD skip + Recovery detection) ============
+        from signal_tracker import should_recover
+
         sent = 0
         skipped = 0
+        recoveries = 0
+
         for sig in results:
             # HOLD skip
             if sig.get("signal") == "HOLD":
                 skipped += 1
                 continue
-            # AI unavailable skip
             if "AI unavailable" in (sig.get("reason") or ""):
                 skipped += 1
                 continue
+
+            # ⭐ Recovery detection
+            symbol = sig.get("symbol")
+            recovery_check = should_recover(symbol)
+            if recovery_check.get("should_recover"):
+                sig["is_recovery"] = True
+                recoveries += 1
+                log.info(f"🔄 Recovery signal: {symbol} — {recovery_check['reason']}")
+            else:
+                sig["is_recovery"] = False
+
             await send_signal(telegram_app, sig)
             sent += 1
 
-        log.info(f"📤 Sent {sent} signals (skipped {skipped} HOLDs)")
+        log.info(f"📤 Sent {sent} signals (skipped {skipped} HOLDs, {recoveries} recovery)")
 
     except Exception:
         log.exception("❌ Analysis cycle crashed")
@@ -126,43 +141,26 @@ def scheduled_job_weekend():
 
 # ==================== SCHEDULER ====================
 def start_scheduler():
-    """Cron jobs — 5 min interval, weekdays all pairs, weekends crypto only."""
     sch = BackgroundScheduler(timezone="UTC")
-
     start_h = BOT_START_HOUR_UTC
     end_h = BOT_END_HOUR_UTC
 
-    # Weekday job
     sch.add_job(
-        scheduled_job_weekday,
-        "cron",
+        scheduled_job_weekday, "cron",
         day_of_week="mon-fri",
-        hour=f"{start_h}-{end_h}",
-        minute="*/5",
-        id="weekday_analysis",
-        max_instances=1,
-        coalesce=True,
+        hour=f"{start_h}-{end_h}", minute="*/15",
+        id="weekday_analysis", max_instances=1, coalesce=True,
     )
-
-    # Weekend job
     sch.add_job(
-        scheduled_job_weekend,
-        "cron",
+        scheduled_job_weekend, "cron",
         day_of_week="sat,sun",
-        hour=f"{start_h}-{end_h}",
-        minute="*/5",
-        id="weekend_analysis",
-        max_instances=1,
-        coalesce=True,
+        hour=f"{start_h}-{end_h}", minute="*/15",
+        id="weekend_analysis", max_instances=1, coalesce=True,
     )
-
     sch.start()
-
-    log.info("⏰ Scheduler started")
+    log.info("⏰ Scheduler started — 15 min interval")
     log.info(f"   Weekdays: {start_h:02d}:00-{end_h:02d}:59 UTC — all pairs")
-    log.info(f"   Weekends: {start_h:02d}:00-{end_h:02d}:59 UTC — "
-             f"{'crypto only' if WEEKEND_CRYPTO_ONLY else 'all pairs'}")
-    log.info(f"   Sleep: {(end_h+1)%24:02d}:00-{(start_h-1)%24:02d}:59 UTC")
+    log.info(f"   Weekends: {start_h:02d}:00-{end_h:02d}:59 UTC — crypto only")
 
 
 # ==================== MAIN ====================
