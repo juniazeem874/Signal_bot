@@ -1,15 +1,25 @@
 # config.py
 import os
 
+# ==================== API KEYS ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ⭐ MULTI CHAT IDs (comma-separated)
+_raw_ids = os.getenv("TELEGRAM_CHAT_IDS", "") or os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_IDS = [
+    int(cid.strip()) for cid in _raw_ids.split(",") if cid.strip().lstrip("-").isdigit()
+]
+TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
+
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 
+# ==================== BRANDING ====================
 BOT_NAME    = "MJ TRADERS"
 BOT_TAGLINE = "Trading Signal Bot"
 
+# ==================== PAIRS ====================
 CRYPTO_PAIRS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
     "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
@@ -27,7 +37,7 @@ CRYPTO_TFS = ["4h", "1h", "15m", "5m", "1m"]
 FOREX_TFS  = ["4h", "1h", "15m"]
 METAL_TFS  = ["1h", "15m"]
 
-AUTO_SCAN_INTERVAL = 3600        # ⭐ 60 min
+AUTO_SCAN_INTERVAL = 3600
 AUTO_SCAN_ENABLED  = True
 SIGNAL_EXPIRY_HOURS = 6
 SIGNAL_AUTO_DELETE_HOURS = 6
