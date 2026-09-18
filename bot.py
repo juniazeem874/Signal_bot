@@ -23,6 +23,7 @@ from signal_tracker import (
     check_all_signals, update_signal_status, remove_signal,
     add_signal_to_tracker, load_tracked_signals,
     log_loss, should_recover, load_recovery_history,
+    is_signal_locked, lock_signal, unlock_signal, get_all_locked,
 )
 from loss_analyzer import (
     analyze_loss, save_loss_analysis,
@@ -37,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 BRAND = "MJ TRADERS"
 
-# ==================== LABELS ====================
 BACK_LABEL     = "⬅️ Back"
 STATUS_LABEL   = "📊 Status"
 AUTO_ON_LABEL  = "🟢 Auto ON"
@@ -55,7 +55,6 @@ DEFAULT_AUTO_ENABLED = getattr(config, "AUTO_SCAN_ENABLED", True)
 
 # ==================== MEMORY ====================
 ACTIVE_SIGNALS = {}
-_LAST_SENT_SIGNALS = {}
 
 
 # ==================== AUTO ON/OFF ====================
@@ -78,8 +77,9 @@ async def _delete_message_job(context):
     d = context.job.data
     try:
         await context.bot.delete_message(chat_id=d["chat_id"], message_id=d["message_id"])
-    except Exception:
-        pass
+        logger.info(f"🗑️ Auto-deleted signal in {d['chat_id']}")
+    except Exception as e:
+        logger.warning(f"auto-delete fail: {e}")
 
 
 def _schedule_auto_delete(context, chat_id, message_id, hours):
@@ -277,27 +277,34 @@ def format_signal(sig):
     return "\n".join(lines)
 
 
-# ==================== SEND SIGNAL ====================
+# ==================== SEND SIGNAL (With Lock) ====================
 async def send_signal(application, sig, chat_id_override=None):
+    """HOLD skip + Signal lock + Auto-delete timer + Tracker."""
+    # 1. HOLD skip
     if sig.get("signal") == "HOLD":
         logger.info(f"⏭️ Skipping HOLD: {sig.get('symbol')}")
         return
 
     symbol = sig.get("symbol")
     signal = sig.get("signal")
-    entry = round(float(sig.get("entry", 0) or 0), 6)
-    now = datetime.utcnow()
 
-    prev = _LAST_SENT_SIGNALS.get(symbol)
-    if prev:
-        prev_signal, prev_entry, prev_ts = prev
-        age_min = (now - prev_ts).total_seconds() / 60
-        same_signal = (prev_signal == signal)
-        same_entry = abs(prev_entry - entry) < (entry * 0.001) if entry > 0 else False
-        if same_signal and same_entry and age_min < 30:
-            logger.info(f"⏭️ Skipping duplicate {symbol} {signal}")
+    # 2. Signal lock check (restart-proof)
+    if not chat_id_override:
+        lock_info = is_signal_locked(symbol)
+        if lock_info.get("locked"):
+            locked_signal = lock_info.get("signal")
+            locked_at = lock_info.get("locked_at", "")
+            try:
+                age_min = (datetime.utcnow() - datetime.fromisoformat(locked_at)).total_seconds() / 60
+            except Exception:
+                age_min = 0
+            logger.info(
+                f"🔒 Skipping {symbol} — locked {locked_signal} "
+                f"({age_min:.0f} min ago). Waiting for TP/SL/Reversal."
+            )
             return
 
+    # 3. Recipients
     bot_data = application.bot_data
     if chat_id_override:
         chat_ids = [chat_id_override]
@@ -311,6 +318,7 @@ async def send_signal(application, sig, chat_id_override=None):
         logger.warning(f"⚠️ No subscribers for {symbol}")
         return
 
+    # 4. Send
     text = format_signal(sig)
     msg_ids = {}
     sent_to = []
@@ -322,23 +330,31 @@ async def send_signal(application, sig, chat_id_override=None):
             )
             msg_ids[cid] = m.message_id
             sent_to.append(cid)
+            # ⭐ Schedule auto-delete after 6h
+            _schedule_auto_delete(application, cid, m.message_id, SIGNAL_EXPIRY_HOURS)
         except Exception as e:
             logger.warning(f"❌ send fail {symbol}→{cid}: {e}")
 
     await asyncio.gather(*[_send_one(cid) for cid in chat_ids])
 
+    # 5. Track + LOCK
     if msg_ids:
         ACTIVE_SIGNALS[symbol] = {**sig, "ts": datetime.utcnow(), "msg_ids": msg_ids}
-        _LAST_SENT_SIGNALS[symbol] = (signal, entry, now)
+
+        if not chat_id_override:
+            lock_signal(symbol, signal, sig)
+
         try:
             add_signal_to_tracker({**sig, "telegram_msg_ids": msg_ids})
         except Exception as e:
             logger.warning(f"tracker fail {symbol}: {e}")
-        logger.info(f"✅ {symbol} {signal} → {len(sent_to)} chats")
+
+        logger.info(f"✅ {symbol} {signal} → {len(sent_to)} chats (LOCKED, will delete in {SIGNAL_EXPIRY_HOURS}h)")
 
 
-# ==================== CLEANUP ====================
+# ==================== CLEANUP (Fallback) ====================
 def cleanup_signals(bot):
+    """Fallback cleanup — 6h purane signals delete karo (job queue fail hone pe)."""
     now = datetime.utcnow()
     to_remove = [s for s, v in list(ACTIVE_SIGNALS.items())
                  if now - v["ts"] > timedelta(hours=SIGNAL_EXPIRY_HOURS)]
@@ -355,6 +371,7 @@ def cleanup_signals(bot):
 
 # ==================== PROCESS OUTCOMES ====================
 async def process_signal_outcomes(application):
+    """Outcome check + loss analysis + UNLOCK signals."""
     try:
         outcomes = check_all_signals()
         if not outcomes:
@@ -383,15 +400,15 @@ async def process_signal_outcomes(application):
                 if status in ("SL_HIT", "REVERSAL"):
                     orig = o.get("original_signal", {})
                     log_loss(symbol, orig, o)
-
                     analysis = analyze_loss(orig, o)
                     save_loss_analysis(analysis)
-
                     await _send_loss_analysis_message(application, analysis, chat_ids)
 
+                # UNLOCK signal
+                unlock_signal(symbol, reason=status)
                 update_signal_status(symbol, status)
                 remove_signal(symbol)
-                logger.info(f"📤 Outcome: {symbol} → {status}")
+                logger.info(f"📤 Outcome: {symbol} → {status} (UNLOCKED)")
     except Exception as e:
         logger.error(f"process_signal_outcomes fail: {e}", exc_info=True)
 
@@ -457,9 +474,9 @@ async def _send_outcome_message(application, outcome, chat_ids):
 
     for cid in chat_ids:
         try:
-            await application.bot.send_message(
-                chat_id=cid, text=text, parse_mode="Markdown"
-            )
+            m = await application.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+            # ⭐ Outcome messages bhi 6h baad delete
+            _schedule_auto_delete(application, cid, m.message_id, SIGNAL_EXPIRY_HOURS)
         except Exception as e:
             logger.warning(f"outcome fail {symbol}→{cid}: {e}")
 
@@ -510,9 +527,8 @@ async def _send_loss_analysis_message(application, analysis, chat_ids):
 
     for cid in chat_ids:
         try:
-            await application.bot.send_message(
-                chat_id=cid, text=text, parse_mode="Markdown"
-            )
+            m = await application.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+            _schedule_auto_delete(application, cid, m.message_id, SIGNAL_EXPIRY_HOURS)
         except Exception as e:
             logger.warning(f"loss analysis fail {symbol}→{cid}: {e}")
 
@@ -557,6 +573,7 @@ async def check_status(update, context):
     enabled = _get_auto_enabled(bd, cid)
     tracked = load_tracked_signals()
     losses = load_recovery_history()
+    locked = get_all_locked()
 
     msg = (
         f"📊 *{BRAND} — Status*\n"
@@ -565,6 +582,7 @@ async def check_status(update, context):
         f"Pairs: {len(ALL_PAIRS_SET)}\n"
         f"Signal expiry: {SIGNAL_EXPIRY_HOURS}h\n"
         f"Tracked signals: {len(tracked)}\n"
+        f"Locked signals: {len(locked)}\n"
         f"Recent losses (24h): {len(losses)}\n"
         f"Your chat ID: `{cid}`\n"
         f"Env chat IDs: `{TELEGRAM_CHAT_IDS}`\n\n"
@@ -588,10 +606,10 @@ async def send_welcome(update, context):
         f"Trading Signal Bot\n\n"
         f"Auto-scanning every `{AUTO_SCAN_INTERVAL // 60} min`\n"
         f"BUY/SELL with Fibonacci + SMC.\n\n"
-        f"HOLD signals skipped.\n"
-        f"TP/SL tracked + loss analysis + recovery.\n\n"
+        f"HOLD skip | Signal lock | 6h auto-delete\n\n"
         f"Commands:\n"
         f"/signals — Active signals\n"
+        f"/locks — Locked signals\n"
         f"/losses — Recent losses\n"
         f"/analysis — Loss deep analysis\n"
         f"/recovery — Recovery status\n"
@@ -628,6 +646,31 @@ async def handle_menu_text(update, context):
             rec = " 🔄" if s.get("is_recovery") else ""
             lines.append(f"• *{s['symbol']}*{rec} {s['signal']} @ `{_fmt_price(s['entry'])}` ({s.get('status', 'ACTIVE')})")
         await safe_reply(update, context, "\n".join(lines), track_nav=True)
+        return
+
+    if text.startswith("/locks"):
+        locked = get_all_locked()
+        if not locked:
+            await safe_reply(update, context, "✅ No locked signals.", track_nav=True)
+            return
+        lines = [f"🔒 *{len(locked)} Locked Signals:*\n"]
+        for sym, data in locked.items():
+            try:
+                age_min = (datetime.utcnow() - datetime.fromisoformat(data["locked_at"])).total_seconds() / 60
+            except Exception:
+                age_min = 0
+            lines.append(f"• *{sym}* {data['signal']} — locked {age_min:.0f} min ago")
+        await safe_reply(update, context, "\n".join(lines), track_nav=True)
+        return
+
+    if text.startswith("/unlock"):
+        args = text.split()
+        if len(args) < 2:
+            await safe_reply(update, context, "Usage: /unlock EUR/USD", track_nav=True)
+            return
+        sym = normalize_symbol(args[1])
+        unlock_signal(sym, reason="manual")
+        await safe_reply(update, context, f"🔓 Unlocked: {sym}", track_nav=True)
         return
 
     if text.startswith("/losses"):
