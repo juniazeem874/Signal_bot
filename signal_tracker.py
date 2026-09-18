@@ -9,6 +9,7 @@ log = logging.getLogger(__name__)
 
 TRACKER_FILE = Path(DATA_DIR) / "active_signals.json"
 RECOVERY_FILE = Path(DATA_DIR) / "recovery_history.json"
+LOCKED_FILE = Path(DATA_DIR) / "locked_signals.json"
 
 
 # ==================== LOAD / SAVE ====================
@@ -20,7 +21,6 @@ def load_tracked_signals() -> list:
         with open(TRACKER_FILE) as f:
             data = json.load(f)
         signals = data.get("signals", [])
-        # 6h+ purane hata do
         cutoff = datetime.utcnow() - timedelta(hours=6)
         signals = [s for s in signals
                    if datetime.fromisoformat(s["created_at"]) > cutoff]
@@ -47,14 +47,12 @@ def save_tracked_signals(signals: list) -> bool:
 
 # ==================== RECOVERY HISTORY ====================
 def load_recovery_history() -> list:
-    """Recent losses ka record — recovery planning ke liye."""
     try:
         if not RECOVERY_FILE.exists():
             return []
         with open(RECOVERY_FILE) as f:
             data = json.load(f)
         losses = data.get("losses", [])
-        # 24h+ purane hata do
         cutoff = datetime.utcnow() - timedelta(hours=24)
         losses = [l for l in losses
                   if datetime.fromisoformat(l["closed_at"]) > cutoff]
@@ -80,9 +78,6 @@ def save_recovery_history(losses: list) -> bool:
 
 
 def log_loss(symbol: str, sig: dict, outcome: dict):
-    """
-    Ek loss record karo — recovery planning ke liye.
-    """
     losses = load_recovery_history()
     entry = {
         "symbol": symbol,
@@ -92,8 +87,6 @@ def log_loss(symbol: str, sig: dict, outcome: dict):
         "take_profit": sig.get("take_profit"),
         "confidence": sig.get("confidence", 0),
         "reason": sig.get("reason", ""),
-        "fib_analysis": sig.get("fib_analysis", ""),
-        "smc_analysis": sig.get("smc_analysis", ""),
         "closed_at": datetime.utcnow().isoformat(),
         "close_price": outcome.get("current_price", 0),
         "close_status": outcome.get("status"),
@@ -107,7 +100,6 @@ def log_loss(symbol: str, sig: dict, outcome: dict):
 
 
 def get_failed_pairs() -> list:
-    """Kaunse pairs recently fail hue — recovery ke liye."""
     losses = load_recovery_history()
     failed = []
     for l in losses:
@@ -123,30 +115,14 @@ def get_failed_pairs() -> list:
 
 
 def should_recover(symbol: str) -> dict:
-    """
-    Check karo — is pair pe recovery trade lena chahiye?
-    Returns:
-      {
-        "should_recover": True/False,
-        "reason": "...",
-        "prev_loss": {...}  # last loss info
-      }
-    """
     losses = load_recovery_history()
     pair_losses = [l for l in losses if l["symbol"] == symbol]
-
     if not pair_losses:
         return {"should_recover": False, "reason": "No previous losses"}
 
-    # Sabse recent loss
     latest = max(pair_losses, key=lambda x: x["closed_at"])
     loss_time = datetime.fromisoformat(latest["closed_at"])
     age_min = (datetime.utcnow() - loss_time).total_seconds() / 60
-
-    # Rules:
-    # 1. Loss 30+ min pehle hua (fresh setup ke liye)
-    # 2. Pichla loss -0.5% se kam (chhota loss, recoverable)
-    # 3. Yahi pair 3+ baar fail nahi hua recently
 
     if age_min < 30:
         return {
@@ -165,14 +141,13 @@ def should_recover(symbol: str) -> dict:
 
     return {
         "should_recover": True,
-        "reason": f"Recovery opportunity ({total_losses} loss{'es' if total_losses>1 else ''} earlier)",
+        "reason": f"Recovery opportunity ({total_losses} loss earlier)",
         "prev_loss": latest,
     }
 
 
 # ==================== SIGNAL TRACKING ====================
 def add_signal_to_tracker(sig: dict):
-    """Naya signal tracker me add karo. Sirf BUY/SELL."""
     if sig.get("signal") not in ("BUY", "SELL"):
         return
 
@@ -201,7 +176,6 @@ def add_signal_to_tracker(sig: dict):
 
 
 def update_signal_status(symbol: str, new_status: str, note: str = ""):
-    """Signal ka status update karo."""
     signals = load_tracked_signals()
     for s in signals:
         if s["symbol"] == symbol:
@@ -213,7 +187,6 @@ def update_signal_status(symbol: str, new_status: str, note: str = ""):
 
 
 def remove_signal(symbol: str):
-    """Signal tracker se hata do."""
     signals = load_tracked_signals()
     signals = [s for s in signals if s["symbol"] != symbol]
     save_tracked_signals(signals)
@@ -230,10 +203,6 @@ def get_current_price_simple(symbol: str) -> float:
 
 
 def evaluate_signal_outcome(sig: dict) -> dict:
-    """
-    Ek signal ka outcome check karo current price se.
-    Returns detailed analysis.
-    """
     symbol = sig["symbol"]
     action = sig["signal"]
     entry = float(sig["entry"])
@@ -244,7 +213,6 @@ def evaluate_signal_outcome(sig: dict) -> dict:
     if current <= 0:
         return {"symbol": symbol, "status": "UNKNOWN", "current_price": 0}
 
-    # PnL %
     if action == "BUY":
         pnl_pct = ((current - entry) / entry) * 100
         tp_hit = current >= tp
@@ -256,7 +224,6 @@ def evaluate_signal_outcome(sig: dict) -> dict:
         sl_hit = current >= sl
         reversal = current > entry + abs(sl - entry) * 0.3
 
-    # TP1/2/3 thresholds
     risk = abs(entry - sl)
     if action == "BUY":
         tp1 = entry + risk * 1
@@ -283,7 +250,6 @@ def evaluate_signal_outcome(sig: dict) -> dict:
     elif reversal:
         status = "REVERSAL"
 
-    # Duration
     created = datetime.fromisoformat(sig["created_at"])
     age_min = (datetime.utcnow() - created).total_seconds() / 60
 
@@ -300,7 +266,6 @@ def evaluate_signal_outcome(sig: dict) -> dict:
 
 
 def check_all_signals() -> list:
-    """Saare tracked signals ka outcome check karo."""
     signals = load_tracked_signals()
     outcomes = []
     for s in signals:
@@ -311,3 +276,78 @@ def check_all_signals() -> list:
         except Exception as e:
             log.error(f"evaluate fail {s.get('symbol')}: {e}")
     return outcomes
+
+
+# ==================== SIGNAL LOCKING ====================
+def load_locked_signals() -> dict:
+    """Locked signals load karo."""
+    try:
+        if not LOCKED_FILE.exists():
+            return {}
+        with open(LOCKED_FILE) as f:
+            data = json.load(f)
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        cleaned = {}
+        for sym, val in data.items():
+            try:
+                ts = datetime.fromisoformat(val["locked_at"])
+                if ts > cutoff:
+                    cleaned[sym] = val
+            except Exception:
+                pass
+        return cleaned
+    except Exception as e:
+        log.error(f"load_locked_signals fail: {e}")
+        return {}
+
+
+def save_locked_signals(data: dict) -> bool:
+    try:
+        with open(LOCKED_FILE, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        return True
+    except Exception as e:
+        log.error(f"save_locked_signals fail: {e}")
+        return False
+
+
+def is_signal_locked(symbol: str) -> dict:
+    """Check karo — pair lock hai ya nahi."""
+    locked = load_locked_signals()
+    entry = locked.get(symbol)
+    if not entry:
+        return {"locked": False}
+    return {
+        "locked": True,
+        "signal": entry.get("signal"),
+        "locked_at": entry.get("locked_at"),
+        "reason": entry.get("reason", ""),
+    }
+
+
+def lock_signal(symbol: str, signal: str, sig_data: dict = None):
+    """Signal ko lock karo."""
+    locked = load_locked_signals()
+    locked[symbol] = {
+        "signal": signal,
+        "locked_at": datetime.utcnow().isoformat(),
+        "entry": sig_data.get("entry") if sig_data else None,
+        "stop_loss": sig_data.get("stop_loss") if sig_data else None,
+        "take_profit": sig_data.get("take_profit") if sig_data else None,
+        "confidence": sig_data.get("confidence", 0) if sig_data else 0,
+    }
+    save_locked_signals(locked)
+    log.info(f"🔒 Locked: {symbol} {signal}")
+
+
+def unlock_signal(symbol: str, reason: str = ""):
+    """Signal ka lock khol do."""
+    locked = load_locked_signals()
+    if symbol in locked:
+        del locked[symbol]
+        save_locked_signals(locked)
+        log.info(f"🔓 Unlocked: {symbol} ({reason})")
+
+
+def get_all_locked() -> dict:
+    return load_locked_signals()
